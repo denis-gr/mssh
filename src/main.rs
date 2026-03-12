@@ -1,15 +1,23 @@
+use anyhow::anyhow;
 use async_sse::decode;
 use futures_lite::StreamExt;
 use futures_lite::io::BufReader;
 use isahc::AsyncReadResponseExt;
 use isahc::auth::{Authentication, Credentials};
 use isahc::config::RedirectPolicy;
+use isahc::http::Uri;
 use isahc::{HttpClient, prelude::*};
 use mail_builder::headers::HeaderType;
 use mail_builder::mime::MimePart;
+use mail_parser::{MimeHeaders, PartType};
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::time::Duration;
+use tokio::sync::mpsc;
+mod opengpg_utils;
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -37,7 +45,7 @@ struct UploadResponse {
     blob_id: String,
 }
 
-fn find_response(json_value: &Value) -> Option<&Value> {
+fn find_response(json_value: &Value) -> Result<&Value, anyhow::Error> {
     json_value
         .get("methodResponses")
         .and_then(|arr| arr.as_array())
@@ -50,34 +58,45 @@ fn find_response(json_value: &Value) -> Option<&Value> {
             })
         })
         .and_then(|item| item.get(1))
+        .ok_or_else(|| anyhow!("No response found in JSON"))
 }
 
-fn get_identity(json: &Value, email: &str) -> Option<String> {
-    find_response(json)
-        .and_then(|resp| resp.get("list"))
+fn get_identity(json: &Value, email: &str) -> Result<String, anyhow::Error> {
+    find_response(json)?
+        .get("list")
         .and_then(|list| list.as_array())
         .and_then(|arr| {
             arr.iter().find_map(|item| {
                 item.get("email")
                     .and_then(|e| e.as_str())
                     .filter(|&e| e == email)
-                    .map(|_| item.get("id").unwrap().as_str().unwrap().to_string())
+                    .and_then(|_| {
+                        item.get("id")
+                            .and_then(|id| id.as_str())
+                            .map(|s| s.to_string())
+                    })
             })
         })
+        .ok_or(anyhow!("No identity found for email: {}", email))
 }
 
-fn get_folder(json: &Value, role: &str) -> Option<String> {
-    find_response(json)
-        .and_then(|resp| resp.get("list"))
+fn get_folder(json: &Value, role: &str) -> Result<String, anyhow::Error> {
+    find_response(json)?
+        .get("list")
         .and_then(|list| list.as_array())
         .and_then(|arr| {
             arr.iter().find_map(|item| {
                 item.get("role")
                     .and_then(|r| r.as_str())
                     .filter(|&r| r == role)
-                    .map(|_| item.get("id").unwrap().as_str().unwrap().to_string())
+                    .and_then(|_| {
+                        item.get("id")
+                            .and_then(|id| id.as_str())
+                            .map(|s| s.to_string())
+                    })
             })
         })
+        .ok_or_else(|| anyhow!("No folder found for role: {}", role))
 }
 
 fn get_last_mes_request(aid: &str) -> String {
@@ -177,154 +196,379 @@ struct JmapSettings {
 }
 
 impl JmapSettings {
-    fn account_id(&self) -> Option<&String> {
-        self.accounts.keys().next()
+    fn account_id(&self) -> Result<&String, anyhow::Error> {
+        self.accounts.keys().next().ok_or(anyhow!("No aid found"))
     }
 }
 
 struct JmapTransport {
-    jmap_session: Option<JmapSettings>,
+    jmap_session: JmapSettings,
     client: HttpClient,
-    last_sse_state: Option<String>,
+    last_sse_state: String,
     domain: String,
-    self_email: String,
-    identity_id: Option<String>,
-    folder_id: Option<String>,
+    email: String,
+    iid: String,
+    fid: String,
+    aid: String,
+    pgp_helper: Option<opengpg_utils::Helper>,
+}
+
+struct IncomingMessage {
+    from: String,
+    to: String,
+    subject: String,
+    body: String,
+    message_id: String,
+    references: String,
+}
+
+struct PtySession {
+    writer: Box<dyn Write + Send>,
+    _child: Box<dyn portable_pty::Child + Send>,
 }
 
 impl JmapTransport {
-    fn new(
+    fn start_pty_session() -> Result<(PtySession, mpsc::Receiver<Vec<u8>>), anyhow::Error> {
+        let pty_system = NativePtySystem::default();
+        let pair = pty_system.openpty(PtySize {
+            rows: 30,
+            cols: 160,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-i");
+        cmd.env("TERM", "dumb");
+        let child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader()?;
+        let mut writer = pair.master.take_writer()?;
+        writer.write_all(b"stty -echo\n")?;
+        writer.flush()?;
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.blocking_send(buffer[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok((
+            PtySession {
+                writer,
+                _child: child,
+            },
+            rx,
+        ))
+    }
+
+    fn write_email_to_pty(
+        &self,
+        pty: &mut PtySession,
+        incoming: &IncomingMessage,
+    ) -> Result<(), anyhow::Error> {
+        pty.writer.write_all(incoming.body.as_bytes())?;
+        pty.writer.flush()?;
+        Ok(())
+    }
+
+    async fn new(
         email: &str,
         username: &str,
         password: &str,
         proxy: Option<String>,
+        pgp_password: Option<String>,
     ) -> Result<Self, anyhow::Error> {
         let client = HttpClient::builder()
-            .proxy(proxy.map(|url| url.parse::<isahc::http::Uri>().unwrap()))
+            .proxy(proxy.map(|url| url.parse::<Uri>()).transpose()?)
             .authentication(Authentication::basic())
             .credentials(Credentials::new(username, password))
             .redirect_policy(RedirectPolicy::Follow)
             .build()?;
 
-        Ok(Self {
-            jmap_session: None,
-            client,
-            last_sse_state: None,
-            domain: email.split('@').nth(1).unwrap().to_string(),
-            self_email: email.to_string(),
-            identity_id: None,
-            folder_id: None,
-        })
-    }
+        let domain = email.split('@').nth(1).unwrap().to_string();
 
-    async fn fetch_setting(&mut self) -> Result<&mut Self, anyhow::Error> {
-        let mut response = self
-            .client
-            .get_async(&format!("https://{}/.well-known/jmap", self.domain))
+        let mut res = client
+            .get_async(&format!("https://{}/.well-known/jmap", domain))
             .await?;
-        let mut settings: JmapSettings = response.json().await?;
+        let mut settings: JmapSettings = res.json().await?;
+        let aid = settings.account_id().unwrap().clone();
         settings.event_source_url = settings
             .event_source_url
             .replace("{types}", "*")
             .replace("{closeafter}", "no")
             .replace("{ping}", "15");
-        settings.download_url = settings
-            .download_url
-            .replace("{accountId}", settings.account_id().unwrap());
-        settings.upload_url = settings
-            .upload_url
-            .replace("{accountId}", settings.account_id().unwrap());
-        let body = get_last_mes_request(settings.account_id().unwrap());
-        let mut response = self
-            .client
-            .post_async(settings.api_url.clone(), body)
-            .await?;
+        settings.download_url = settings.download_url.replace("{accountId}", aid.as_str());
+        settings.upload_url = settings.upload_url.replace("{accountId}", aid.as_str());
+
+        let body = get_last_mes_request(aid.as_str());
+        let mut response = client.post_async(&settings.api_url, body).await?;
         let json: Value = response.json::<Value>().await?;
-        let resp =
-            serde_json::from_value::<EmailGetResponse>(find_response(&json).unwrap().clone())?;
+        let resp = serde_json::from_value::<EmailGetResponse>(find_response(&json)?.clone())?;
 
-        self.last_sse_state = Some(resp.state);
-        self.jmap_session = Some(settings.clone());
+        let last_sse_state = resp.state;
 
-        let aid = settings.account_id().unwrap();
-
-        let mut response = self
-            .client
-            .post_async(settings.api_url.clone(), get_identity_id_request(aid))
+        let mut response = client
+            .post_async(&settings.api_url, get_identity_id_request(&aid))
             .await?;
-        self.identity_id = get_identity(&response.json::<Value>().await.unwrap(), &self.self_email);
+        let iid = get_identity(&response.json::<Value>().await?, email)?;
 
-        let mut response = self
-            .client
-            .post_async(settings.api_url.clone(), get_folders_request(aid))
+        let mut response = client
+            .post_async(&settings.api_url, get_folders_request(&aid))
             .await?;
-        self.folder_id = get_folder(&response.json::<Value>().await.unwrap(), "sent");
+        let fid = get_folder(&response.json::<Value>().await?, "sent")?;
 
-        Ok(self)
+        let helper = opengpg_utils::Helper::load_dir("keys", pgp_password).ok();
+
+        Ok(Self {
+            jmap_session: settings,
+            client,
+            last_sse_state,
+            domain,
+            email: email.to_string(),
+            iid,
+            fid,
+            aid,
+            pgp_helper: helper,
+        })
     }
 
-    async fn run_echo(&mut self) -> Result<(), anyhow::Error> {
-        let settings = self.jmap_session.as_ref().unwrap().clone();
-        let sse_response = self.client.get_async(&settings.event_source_url).await?;
+    async fn run(&mut self) -> Result<(), anyhow::Error> {
+        let sse_response = self
+            .client
+            .get_async(self.jmap_session.event_source_url.clone())
+            .await?;
         let reader = BufReader::new(sse_response.into_body());
         let mut sse_reader = decode(reader);
-        while let Some(event) = sse_reader.next().await {
-            match event {
-                Ok(async_sse::Event::Message(msg)) => {
-                    if msg.name() != "state" {
-                        continue;
-                    }
-                    let aid = settings.account_id().unwrap();
-                    let state = self.last_sse_state.clone().ok_or(anyhow::anyhow!(""))?;
-                    let mut resp = self
-                        .client
-                        .post_async(&settings.api_url, get_new_mes_request(aid, &state))
-                        .await?;
-                    let val: Value = resp.json().await?;
-                    let resp = serde_json::from_value::<EmailGetResponse>(
-                        find_response(&val).unwrap().clone(),
-                    )?;
-                    self.last_sse_state = Some(resp.state);
-                    for item in resp.list {
-                        let from = item.from.last().map(|a| a.email.as_str()).unwrap_or("");
-                        if from.contains(&("@".to_owned() + &self.domain)) {
-                            continue;
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        let (mut pty, mut pty_output_rx) = Self::start_pty_session()?;
+        let mut outgoing_buffer = String::new();
+        let mut current_recipient: Option<String> = None;
+        let mut current_subject: Option<String> = None;
+        let mut current_in_reply_to: Option<String> = None;
+        let mut current_references: Option<String> = None;
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if !outgoing_buffer.trim().is_empty() {
+                        if let Some(to) = current_recipient.clone() {
+                            let body = std::mem::take(&mut outgoing_buffer);
+                            let subject = current_subject
+                                .clone()
+                                .unwrap_or_else(|| format!("Terminal message from {}", self.email));
+                            let in_reply_to = current_in_reply_to.as_deref();
+                            let references = current_references.as_deref();
+                            self.send_text_email(&to, &subject, &body, in_reply_to, references).await?;
                         }
-                        let blob_id = item.blob_id;
-                        let url = settings.download_url.replace("{blobId}", &blob_id);
-                        let mut resp = self.client.get_async(&url).await?;
-                        let text = resp.text().await?;
-                        self.handle_new_message(&text).await?;
                     }
                 }
-                Ok(async_sse::Event::Retry(duration)) => println!("Retry after: {:?}", duration),
-                Err(e) => eprintln!("Error in SSE stream: {}", e),
+                maybe_chunk = pty_output_rx.recv() => {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            let text = String::from_utf8_lossy(&chunk);
+                            outgoing_buffer.push_str(&text);
+                        }
+                        None => break,
+                    }
+                }
+                event = sse_reader.next() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+
+                    match event {
+                        Ok(async_sse::Event::Message(msg)) => {
+                            if msg.name() != "state" {
+                                continue;
+                            }
+                            let mut resp = self
+                                .client
+                                .post_async(
+                                    &self.jmap_session.api_url,
+                                    get_new_mes_request(&self.aid, &self.last_sse_state),
+                                )
+                                .await?;
+                            let json = resp.json::<Value>().await?;
+                            let val = find_response(&json)?.clone();
+                            let resp = serde_json::from_value::<EmailGetResponse>(val)?;
+                            self.last_sse_state = resp.state;
+                            let url_template = self.jmap_session.download_url.clone();
+                            for item in resp.list {
+                                let from = item.from.last().map(|a| a.email.as_str()).unwrap_or("");
+                                if from.contains(&("@".to_owned() + &self.domain)) {
+                                    continue;
+                                }
+                                let url = url_template.replace("{blobId}", &item.blob_id);
+                                let mut resp = self.client.get_async(&url).await?;
+                                let text = resp.text().await?;
+                                if let Some(incoming) = self.parse_incoming_message(&text)? {
+                                    self.write_email_to_pty(&mut pty, &incoming)?;
+                                    current_recipient = Some(incoming.from.clone());
+                                    current_subject = Some(incoming.subject);
+                                    current_in_reply_to = Some(incoming.message_id.clone());
+                                    current_references = Some(if incoming.references.trim().is_empty() {
+                                        incoming.message_id.clone()
+                                    } else {
+                                        format!("{} {}", incoming.references.trim(), incoming.message_id)
+                                    });
+                                }
+                            }
+                        }
+                        Ok(async_sse::Event::Retry(duration)) => println!("Retry after: {:?}", duration),
+                        Err(e) => eprintln!("Error in SSE stream: {}", e),
+                    }
+                }
             }
         }
+
         Ok(())
     }
-    async fn handle_new_message(&mut self, mes: &str) -> Result<(), anyhow::Error> {
+
+    fn parse_incoming_message(&self, mes: &str) -> Result<Option<IncomingMessage>, anyhow::Error> {
         let mail = mail_parser::MessageParser::default()
             .parse(mes.as_bytes())
             .ok_or_else(|| anyhow::anyhow!("Failed to parse email message"))?;
-        let m_id = mail.message_id().unwrap_or("unknown");
-        let from = mail.from().unwrap().last().unwrap().address().unwrap();
-        let to = mail.to().unwrap().last().unwrap().address().unwrap();
-        let subject = mail.subject().unwrap_or("No subject");
-        let references = mail.references().as_text().unwrap_or_default();
-        let new_mail = mail_builder::MessageBuilder::new()
-            .from(to)
-            .to(from)
-            .subject(format!("Re: {}", subject))
-            .header("References", HeaderType::Text(references.into()))
-            .in_reply_to(m_id)
-            .body(MimePart::new(
-                "text/plain",
-                format!("Echoing back your message with ID: {}", m_id).into_bytes(),
-            ))
+        println!("{:?}", mail);
+
+        if let Some(helper) = &self.pgp_helper {
+            if let Some(ct) = mail.content_type() {
+                if ct.c_type == "multipart" && ct.c_subtype == Some("encrypted".into()) {
+                    let encrypted_part = mail
+                        .attachments()
+                        .find(|att| {
+                            att.content_type()
+                                .map(|ct| {
+                                    ct.c_type == "application"
+                                        && ct.c_subtype == Some("octet-stream".into())
+                                })
+                                .unwrap_or(false)
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "No PGP encrypted part found in multipart/encrypted email"
+                            )
+                        })?;
+                    println!("Found encrypted part: {:?}", encrypted_part);
+                    let encrypted_content = match encrypted_part.body {
+                        PartType::Text(ref text) => text.clone(),
+                        PartType::Binary(ref data) => String::from_utf8_lossy(data),
+                        _ => {
+                            return Err(anyhow::anyhow!(
+                                "Unsupported content type in encrypted part"
+                            ));
+                        }
+                    }
+                    .to_string();
+                    println!("Encrypted content: {}", encrypted_content);
+                    let decrypted_content = helper.decrypt_message(encrypted_content)?;
+                    println!("Decrypted content: {}", decrypted_content);
+                    return self.parse_incoming_message(&decrypted_content);
+                }
+            }
+        }
+        
+        println!("{:?}", mail);
+        let from = mail
+            .from()
+            .and_then(|v| v.last())
+            .and_then(|v| v.address())
+            .unwrap_or_default()
+            .to_string();
+        let to = mail
+            .to()
+            .and_then(|v| v.last())
+            .and_then(|v| v.address())
+            .unwrap_or_default()
+            .to_string();
+
+        if from.is_empty() || to.is_empty() {
+            return Ok(None);
+        }
+
+        let body = mail
+            .body_text(0)
+            .map(|v| v.into_owned())
+            .unwrap_or_else(|| "(no text body)".to_string());
+
+        Ok(Some(IncomingMessage {
+            from,
+            to,
+            subject: mail.subject().unwrap_or("No subject").to_string(),
+            body,
+            message_id: mail.message_id().unwrap_or_default().to_string(),
+            references: mail.references().as_text().unwrap_or_default().to_string(),
+        }))
+    }
+
+    async fn send_text_email(
+        &self,
+        to: &str,
+        subject: &str,
+        body: &str,
+        in_reply_to: Option<&str>,
+        references: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        let mut new_mail = mail_builder::MessageBuilder::new()
+            .from(self.email.as_str())
+            .to(to)
+            .subject(subject)
+            .header(
+                "References",
+                HeaderType::Text(references.unwrap_or_default().to_string().into()),
+            )
+            .in_reply_to(in_reply_to.unwrap_or_default())
+            .body(MimePart::new("text/plain", body.as_bytes().to_vec()))
             .write_to_string()
             .map_err(|e| anyhow::anyhow!("Failed to build response email: {}", e))?;
-        let settings = self.jmap_session.as_ref().unwrap();
+        if let Some(helper) = &self.pgp_helper {
+            if helper.has_client_cert(to) {
+                println!("Encrypting email to {}", to);
+                let encrypted_mail = helper.encrypt_message(new_mail.clone(), to.to_string())?;
+                new_mail = mail_builder::MessageBuilder::new()
+                    .from(self.email.as_str())
+                    .to(to)
+                    .subject(subject)
+                    .header(
+                        "References",
+                        HeaderType::Text(references.unwrap_or_default().to_string().into()),
+                    )
+                    .in_reply_to(in_reply_to.unwrap_or_default())
+                    .body(MimePart::new(
+                        "multipart/encrypted; protocol=\"application/pgp-encrypted\"",
+                        vec![
+                            MimePart::new("application/pgp-encrypted", b"Version: 1".to_vec())
+                                .header(
+                                    "Content-Description",
+                                    HeaderType::Text("PGP/MIME version identification".into()),
+                                ),
+                            MimePart::new("application/octet-stream", encrypted_mail.into_bytes())
+                                .header(
+                                    "Content-Description",
+                                    HeaderType::Text("OpenPGP encrypted message".into()),
+                                )
+                                .header(
+                                    "Content-Disposition",
+                                    HeaderType::Text("attachment; filename=\"msg.asc\"".into()),
+                                ),
+                        ],
+                    ))
+                    .write_to_string()
+                    .map_err(|e| anyhow::anyhow!("Failed to build encrypted email: {}", e))?;
+            }
+        }
+        let settings = &self.jmap_session;
         let mut response = self
             .client
             .post_async(&settings.upload_url, new_mail)
@@ -335,16 +579,11 @@ impl JmapTransport {
             .client
             .post_async(
                 &settings.api_url,
-                get_send_blob_as_email_request(
-                    settings.account_id().unwrap(),
-                    &self.identity_id.clone().unwrap(),
-                    &self.folder_id.clone().unwrap(),
-                    &new_blob_id,
-                ),
+                get_send_blob_as_email_request(&self.aid, &self.iid, &self.fid, &new_blob_id),
             )
             .await?;
         let val: Value = response.json().await?;
-        if let Some(not_created) = find_response(&val).unwrap().get("notCreated") {
+        if let Some(not_created) = find_response(&val)?.get("notCreated") {
             println!("Failed to send email: {}", not_created);
         } else {
             println!("Email sent successfully");
@@ -359,6 +598,7 @@ struct Config {
     username: String,
     password: String,
     proxy: Option<String>,
+    pgp_password: Option<String>,
 }
 
 #[tokio::main]
@@ -366,15 +606,14 @@ async fn main() -> Result<(), anyhow::Error> {
     let config_str = std::fs::read_to_string("config.toml")?;
     let config: Config = toml::from_str(&config_str)?;
 
-    let mut _transport = JmapTransport::new(
+    let mut transport = JmapTransport::new(
         &config.email,
         &config.username,
         &config.password,
         config.proxy,
-    )?
-    .fetch_setting()
-    .await?
-    .run_echo()
+        config.pgp_password,
+    )
     .await?;
-    Ok(())
+
+    transport.run().await
 }
