@@ -73,9 +73,9 @@ impl Helper {
         })
     }
 
-    pub fn has_client_cert(&self, email: &str) -> bool {
+    /*pub fn has_client_cert(&self, email: &str) -> bool {
         self.client_certs.contains_key(email)
-    }
+    }*/
 
     pub fn decrypt_message(&self, message: String) -> Result<String, Error> {
         let policy = StandardPolicy::new();
