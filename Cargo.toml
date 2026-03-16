@@ -7,15 +7,18 @@ edition = "2024"
 anyhow = { version = "1.0", default-features = false }
 async-sse = { version = "5.1", default-features = false }
 futures-lite = { version = "2.6", default-features = false, features = ["std"] }
-isahc = { version = "1.7", default-features = false, features = [
-    "json",
-    "text-decoding",
-] }
+isahc = { version = "1.7", default-features = false, features = ["json"] }
 mail-builder = { version = "0.4", default-features = false }
 mail-parser = { version = "0.11", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false }
-tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt-multi-thread",
+    "time",
+    "sync",
+    "signal",
+] }
 toml = { version = "1.0", default-features = false, features = [
     "parse",
     "serde",
@@ -27,3 +30,4 @@ portable-pty = { version = "0.9", default-features = false }
 log = { version = "0.4.29", features = ["std"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 nix = { version = "0.28", features = ["term"] }
+bytes = "1.11.1"

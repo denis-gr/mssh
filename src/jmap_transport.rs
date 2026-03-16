@@ -1,5 +1,7 @@
+use crate::common::MessageFile;
 use anyhow::anyhow;
 use async_sse::decode;
+use bytes::Bytes;
 use futures_lite::StreamExt;
 use futures_lite::io::BufReader;
 use isahc::AsyncReadResponseExt;
@@ -11,7 +13,6 @@ use log;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[derive(Deserialize, Debug, Clone)]
@@ -203,21 +204,7 @@ pub struct JmapTransport {
     iid: String,
     fid: String,
     aid: String,
-    tick: Duration,
     email: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct MessageFile {
-    pub(crate) client: String,
-    pub(crate) content: String,
-}
-
-impl MessageFile {
-    pub fn new_channel() -> (mpsc::Receiver<Self>, mpsc::Sender<Self>) {
-        let (tx, rx) = mpsc::channel(100);
-        (rx, tx)
-    }
 }
 
 impl JmapTransport {
@@ -226,7 +213,6 @@ impl JmapTransport {
         username: &str,
         password: &str,
         proxy: Option<String>,
-        send_answer_interval: Duration,
     ) -> Result<Self, anyhow::Error> {
         let client = HttpClient::builder()
             .proxy(proxy.map(|url| url.parse::<Uri>()).transpose()?)
@@ -278,7 +264,6 @@ impl JmapTransport {
             iid,
             fid,
             aid,
-            tick: send_answer_interval,
             email: email.to_string(),
         })
     }
@@ -294,14 +279,11 @@ impl JmapTransport {
             .await?;
         let reader = BufReader::new(sse_response.into_body());
         let mut sse_reader = decode(reader);
-        let mut ticker = tokio::time::interval(self.tick);
         loop {
             tokio::select! {
-                _ = ticker.tick() => {
-                    while let Ok(msg) = incoming.try_recv() {
-                        log::info!("Sending email to {}", msg.client);
-                        self.send_message(msg).await?;
-                    }
+                Some(msg) = incoming.recv() => {
+                    log::info!("Sending email to {}", msg.client);
+                    self.send_message(msg).await?;
                 }
                 event = sse_reader.next() => {
                     match event {
@@ -326,7 +308,7 @@ impl JmapTransport {
         let settings = &self.jmap_session;
         let mut response = self
             .client
-            .post_async(&settings.upload_url, msg.content)
+            .post_async(&settings.upload_url, msg.message_file.as_ref())
             .await?;
         let upload_resp = response.json::<UploadResponse>().await?;
         let new_blob_id = upload_resp.blob_id;
@@ -374,7 +356,7 @@ impl JmapTransport {
             log::info!("Downloading email from {}", item.from[0].email);
             tx.send(MessageFile {
                 client: item.from.last().unwrap().email.clone(), // len == 1
-                content: resp.text().await?,
+                message_file: Bytes::from(resp.bytes().await?),
             })
             .await?;
         }

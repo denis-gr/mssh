@@ -77,20 +77,20 @@ impl Helper {
         self.client_certs.contains_key(email)
     }*/
 
-    pub fn decrypt_message(&self, message: String) -> Result<String, Error> {
+    pub fn decrypt_message(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
         let policy = StandardPolicy::new();
-        let helper = self.clone();
+        let helper: Helper = self.clone();
 
         let mut decryptor =
-            DecryptorBuilder::from_bytes(message.as_bytes())?.with_policy(&policy, None, helper)?;
+            DecryptorBuilder::from_bytes(message)?.with_policy(&policy, None, helper)?;
 
         let mut decrypted_message = Vec::new();
         decryptor.read_to_end(&mut decrypted_message)?;
 
-        Ok(String::from_utf8(decrypted_message)?)
+        Ok(decrypted_message)
     }
 
-    pub fn encrypt_message(&self, message: String, email: String) -> Result<String, Error> {
+    pub fn encrypt_message(&self, message: &[u8], email: String) -> Result<Vec<u8>, Error> {
         let recipient_cert = self
             .client_certs
             .get(&email)
@@ -137,10 +137,10 @@ impl Helper {
         let message_stream = Signer::new(message_stream, signing_key)?.build()?;
         let mut writer = LiteralWriter::new(message_stream).build()?;
 
-        writer.write_all(message.as_bytes())?;
+        writer.write_all(message)?;
         writer.finalize()?;
 
-        Ok(String::from_utf8(sink)?)
+        Ok(sink)
     }
 }
 

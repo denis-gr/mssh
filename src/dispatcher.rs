@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 //pub use crate::echo::Echo;
-pub use crate::jmap_transport::MessageFile;
+pub use crate::common::MessageFile;
 pub use crate::terminal::Terminal as Echo;
+use bytes::Bytes;
 use mail_parser::PartType;
 use std::sync::Arc;
 use tokio::sync::{
@@ -79,16 +80,16 @@ impl LastMailState {
             mail = mail.references(reference.clone());
         }
         Ok(MessageFile {
-            client,
-            content: mail.write_to_string()?,
+            client: client,
+            message_file: Bytes::from(mail.write_to_vec()?),
         })
     }
 }
 
 struct ClientContext {
     tr_in_tx: Sender<Vec<u8>>,
-    client_email: String,
-    server_email: String,
+    client: String,
+    server: String,
     last_mail_state: Mutex<LastMailState>,
 }
 
@@ -103,7 +104,7 @@ fn get_emails(msg: &[u8]) -> Result<(String, String), anyhow::Error> {
     if clients.len() != 1 {
         return Err(anyhow::anyhow!("Found {} adresses in From", clients.len()));
     }
-    let client_email = clients[0]
+    let client = clients[0]
         .address()
         .map(|s| s.to_string())
         .ok_or(anyhow::anyhow!("Failed to extract client email"))?;
@@ -114,32 +115,33 @@ fn get_emails(msg: &[u8]) -> Result<(String, String), anyhow::Error> {
     if servers.len() != 1 {
         return Err(anyhow::anyhow!("Found {} adresses in To", servers.len()));
     }
-    let server_email = servers[0]
+    let server = servers[0]
         .address()
         .map(|s| s.to_string())
         .ok_or(anyhow::anyhow!("Failed to extract server email"))?;
-    Ok((client_email, server_email))
+    Ok((client, server))
 }
 
 impl ClientContext {
     pub fn create(
         msg: MessageFile,
         out_tx: Sender<MessageFile>,
+        tick_interval: std::time::Duration,
     ) -> Result<Arc<Self>, anyhow::Error> {
         log::info!("Creating context for client {}", msg.client);
-        let (client_email, server_email) = get_emails(&msg.content.as_bytes())?;
+        let (client, server) = get_emails(&msg.message_file.as_ref())?;
         let (tr_in_tx, tr_in_rx) = channel::<Vec<u8>>(128);
         let (tr_out_tx, mut tr_out_rx) = channel::<Vec<u8>>(128);
         let mut tr = Echo::new()?;
 
         tokio::spawn(async move {
-            tr.run(tr_in_rx, tr_out_tx).await;
+            tr.run(tr_out_tx, tr_in_rx).await;
         });
 
         let context = Arc::new(Self {
             tr_in_tx,
-            client_email,
-            server_email,
+            client,
+            server,
             last_mail_state: Mutex::new(LastMailState {
                 subject: None,
                 client_message_id: None,
@@ -151,9 +153,9 @@ impl ClientContext {
 
         let context2 = Arc::clone(&context);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            let mut tick = tokio::time::interval(tick_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            tick.tick().await; 
+            tick.tick().await;
             let mut buffer = Vec::<u8>::new();
             loop {
                 tokio::select! {
@@ -164,7 +166,7 @@ impl ClientContext {
                         if !buffer.is_empty() {
                             let mes = context2.send_from_tr(buffer).await;
                             if out_tx.send(mes).await.is_err() {
-                                log::info!("Output channel closed for client {}", context2.client_email);
+                                log::info!("Output channel closed for client {}", context2.client);
                                 break;
                             }
                             buffer = Vec::new();
@@ -177,15 +179,15 @@ impl ClientContext {
     }
 
     async fn send_from_tr(&self, mes: Vec<u8>) -> MessageFile {
-        log::info!("New data from thread for client {}", self.client_email);
+        log::info!("New data from thread for client {}", self.client);
         let mes = self.last_mail_state.lock().await.create_reply(mes);
-        mes.to_message_file(self.client_email.clone(), self.server_email.clone())
+        mes.to_message_file(self.client.clone(), self.server.clone())
             .unwrap()
     }
 
     pub async fn send_to_tr(&self, mes: MessageFile) {
-        log::info!("New data for thread for client {}", self.client_email);
-        let state = LastMailState::from_bytes(&mes.content.as_bytes()).unwrap();
+        log::info!("New data for thread for client {}", self.client);
+        let state = LastMailState::from_bytes(&mes.message_file.as_ref()).unwrap();
         let body = state.body.clone().unwrap_or_default();
         {
             let mut state_lock = self.last_mail_state.lock().await;
@@ -197,23 +199,29 @@ impl ClientContext {
 
 pub struct Dispatcher {
     clients: HashMap<String, Arc<ClientContext>>,
+    tick_interval: std::time::Duration,
 }
 
 impl Dispatcher {
-    pub fn new() -> Result<Self, anyhow::Error> {
+    pub fn new(tick_interval: std::time::Duration) -> Result<Self, anyhow::Error> {
         Ok(Dispatcher {
             clients: HashMap::new(),
+            tick_interval,
         })
     }
 
-    pub async fn run(&mut self, mut in_rx: Receiver<MessageFile>, out_tx: Sender<MessageFile>) {
+    pub async fn run(
+        &mut self,
+        out_tx: Sender<MessageFile>,
+        mut in_rx: Receiver<MessageFile>,
+    ) -> Result<(), anyhow::Error> {
         while let Some(msg) = in_rx.recv().await {
             let client = msg.client.clone();
-            let context = self
-                .clients
-                .entry(client.clone())
-                .or_insert_with(|| ClientContext::create(msg.clone(), out_tx.clone()).unwrap());
+            let context = self.clients.entry(client.clone()).or_insert_with(|| {
+                ClientContext::create(msg.clone(), out_tx.clone(), self.tick_interval).unwrap()
+            });
             context.send_to_tr(msg).await;
         }
+        Ok(())
     }
 }

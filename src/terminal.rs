@@ -46,7 +46,7 @@ impl Terminal {
         })
     }
 
-    pub async fn run(&mut self, mut in_rx: Receiver<Vec<u8>>, out_tx: Sender<Vec<u8>>) {
+    pub async fn run(&mut self, out_tx: Sender<Vec<u8>>, mut in_rx: Receiver<Vec<u8>>) {
         let (tx, mut rx) = channel::<Vec<u8>>(128);
 
         let mut reader = self
