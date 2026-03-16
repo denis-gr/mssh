@@ -164,6 +164,7 @@ impl SecurityLayer {
                 "Expected exactly one From address in decrypted message"
             ));
         }
+        let vec = encrypted.to_vec();
         let mut out_mail = mail_builder::MessageBuilder::new()
             .from(to[0].to_string())
             .to(from[0].to_string())
@@ -171,19 +172,11 @@ impl SecurityLayer {
             .body(MimePart::new(
                 "multipart/encrypted; protocol=\"application/pgp-encrypted\"",
                 vec![
-                    MimePart::new("application/pgp-encrypted", b"Version: 1".to_vec()).header(
-                        "Content-Description",
-                        HeaderType::Text("PGP/MIME version identification".into()),
+                    MimePart::new("application/pgp-encrypted", "Version: 1"),
+                    MimePart::new("application/octet-stream", str::from_utf8(&vec)?).header(
+                        "Content-Disposition",
+                        HeaderType::Text("attachment; filename=m.asc".into()),
                     ),
-                    MimePart::new("application/octet-stream", encrypted.as_slice())
-                        .header(
-                            "Content-Description",
-                            HeaderType::Text("OpenPGP encrypted message".into()),
-                        )
-                        .header(
-                            "Content-Disposition",
-                            HeaderType::Text("attachment; filename=\"msg.asc\"".into()),
-                        ),
                 ],
             ));
         if let HeaderValue::Address(addr) = mail.in_reply_to() {

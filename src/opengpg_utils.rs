@@ -124,7 +124,7 @@ impl Helper {
             let p = self
                 .password
                 .as_ref()
-                .ok_or_else(|| Error::msg("Signing key is encrypted; set MSSH_PGP_PASSWORD"))?;
+                .ok_or_else(|| Error::msg("Signing key is encrypted; set password"))?;
             signing_key = signing_key.decrypt_secret(p)?;
         }
 
