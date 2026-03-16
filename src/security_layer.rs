@@ -1,6 +1,7 @@
 pub use crate::jmap_transport::MessageFile;
 pub use crate::opengpg_utils::Helper;
 
+use log;
 use mail_builder::{headers::HeaderType, mime::MimePart};
 use mail_parser::{HeaderValue, MimeHeaders, PartType};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -35,7 +36,7 @@ impl SecurityLayer {
                     match self.decrypt(&msg) {
                         Ok(decrypted) => out_tx.send(decrypted).await.unwrap(),
                         Err(e) => {
-                            eprintln!("Decryption failed: {}", e);
+                            log::error!("Decryption failed: {}", e);
                         }
                     }
                 }
@@ -43,7 +44,7 @@ impl SecurityLayer {
                     match self.encrypt(&msg) {
                         Ok(encrypted) => in_tx.send(encrypted).await.unwrap(),
                         Err(e) => {
-                            eprintln!("Encryption failed: {}", e);
+                            log::error!("Encryption failed: {}", e);
                         }
                     }
                 }
@@ -65,6 +66,7 @@ impl SecurityLayer {
             && subtyp == "encrypted"
             && protocol == Some("application/pgp-encrypted")
         {
+            log::info!("Decrypting message from {} (pgp-encrypted)", mes.client);
             let part = mail
                 .attachments()
                 .find(|a| {
@@ -107,9 +109,11 @@ impl SecurityLayer {
             && subtyp == "signed"
             && protocol == Some("application/pgp-signature")
         {
+            log::info!("Decrypting message from {} (pgp-signature)", mes.client);
             // TODO: support signed messages
             return Err(anyhow::anyhow!("Signed messages are not supported"));
         } else if self.pass_raw {
+            log::info!("Decrypting message from {} (Non-encrypted)", mes.client);
             return Ok(mes.clone());
         } else {
             return Err(anyhow::anyhow!(
@@ -125,14 +129,15 @@ impl SecurityLayer {
         {
             Ok(encrypted) => Ok(encrypted),
             Err(e) => {
-                eprintln!("Encryption failed for client {}: {}", msg.client, e);
                 if self.pass_raw {
+                    log::info!("Encrypting message to {} (Non-encrypted)", msg.client);
                     return Ok(msg.clone());
                 } else {
-                    Err(anyhow::anyhow!("Encryption failed and pass_raw is false"))
+                    Err(anyhow::anyhow!("Encryption failed: {}", e))
                 }
             }
         }?;
+        log::info!("Encrypting message to {} (pgp-encrypted)", msg.client);
         let mail = mail_parser::MessageParser::default()
             .parse(msg.content.as_bytes())
             .ok_or_else(|| anyhow::anyhow!("Failed to parse encrypted message"))?;

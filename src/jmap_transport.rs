@@ -7,6 +7,7 @@ use isahc::auth::{Authentication, Credentials};
 use isahc::config::RedirectPolicy;
 use isahc::http::Uri;
 use isahc::{HttpClient, prelude::*};
+use log;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -24,7 +25,7 @@ struct EmailGetResponse {
 #[serde(rename_all = "camelCase")]
 struct EmailGetResponseItem {
     blob_id: String,
-    from: Vec<EmailAddress>
+    from: Vec<EmailAddress>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -234,13 +235,17 @@ impl JmapTransport {
             .redirect_policy(RedirectPolicy::Follow)
             .build()?;
 
-        let domain = email.split('@').nth(1).unwrap().to_string();
+        let domain = email
+            .split('@')
+            .nth(1)
+            .map(|s| s.to_string())
+            .ok_or(anyhow::anyhow!("Email incorrect"))?;
 
         let mut res = client
             .get_async(&format!("https://{}/.well-known/jmap", domain))
             .await?;
         let mut settings: JmapSettings = res.json().await?;
-        let aid = settings.account_id().unwrap().clone();
+        let aid = settings.account_id()?.clone();
         settings.event_source_url = settings
             .event_source_url
             .replace("{types}", "*")
@@ -294,6 +299,7 @@ impl JmapTransport {
             tokio::select! {
                 _ = ticker.tick() => {
                     while let Ok(msg) = incoming.try_recv() {
+                        log::info!("Sending email to {}", msg.client);
                         self.send_message(msg).await?;
                     }
                 }
@@ -303,10 +309,11 @@ impl JmapTransport {
                             if msg.name() != "state" {
                                 continue;
                             }
+                            log::info!("New SSE state");
                             self.download_messages(&outgoing).await?;
                         }
                         Some(Err(e)) => {
-                            eprintln!("Error reading SSE: {}", e);
+                            log::warn!("Error reading SSE: {}", e);
                         }
                         _ => {}
                     }
@@ -332,14 +339,17 @@ impl JmapTransport {
             .await?;
         let val: Value = response.json().await?;
         if let Some(not_created) = find_response(&val)?.get("notCreated") {
-            println!("Failed to send email: {}", not_created);
+            log::warn!("Failed to send email: {}", not_created);
         } else {
-            println!("Email sent successfully");
+            log::info!("Email sent successfully");
         }
         Ok(())
     }
 
-    async fn download_messages(&mut self, tx: &mpsc::Sender<MessageFile>) -> Result<(), anyhow::Error> {
+    async fn download_messages(
+        &mut self,
+        tx: &mpsc::Sender<MessageFile>,
+    ) -> Result<(), anyhow::Error> {
         let mut r = self
             .client
             .post_async(
@@ -361,6 +371,7 @@ impl JmapTransport {
             }
             let url = url_template.replace("{blobId}", &item.blob_id);
             let mut resp = self.client.get_async(&url).await?;
+            log::info!("Downloading email from {}", item.from[0].email);
             tx.send(MessageFile {
                 client: item.from.last().unwrap().email.clone(), // len == 1
                 content: resp.text().await?,
@@ -370,5 +381,3 @@ impl JmapTransport {
         Ok(())
     }
 }
-
-

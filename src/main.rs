@@ -1,13 +1,14 @@
 mod dispatcher;
-mod echo;
+//mod echo;
 mod jmap_transport;
 mod opengpg_utils;
 mod security_layer;
-//mod terminal;
+mod terminal;
 
 use anyhow::Context;
 use serde::Deserialize;
 use std::time::Duration;
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[derive(Deserialize)]
 struct Config {
@@ -20,6 +21,11 @@ struct Config {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(EnvFilter::new("warn,mssh=trace"))
+        .init();
+
     let config_str = std::fs::read_to_string("config.toml")?;
     let config: Config = toml::from_str(&config_str)?;
 

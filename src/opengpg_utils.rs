@@ -4,6 +4,7 @@ use sequoia_openpgp::serialize::stream::Armorer;
 use sequoia_openpgp::serialize::stream::Signer;
 use sequoia_openpgp::{self as openpgp};
 
+use log;
 use openpgp::crypto::{Password, SessionKey};
 use openpgp::parse::Parse;
 use openpgp::parse::stream::{
@@ -14,9 +15,9 @@ use openpgp::serialize::stream::{Encryptor, LiteralWriter, Message};
 use openpgp::types::SymmetricAlgorithm;
 use openpgp::{Cert, KeyHandle};
 
+use std::fs;
 use std::iter::once;
 use std::str::FromStr;
-use std::fs;
 
 use anyhow::Error;
 use anyhow::anyhow;
@@ -46,7 +47,10 @@ impl Helper {
             })
             .collect::<Vec<Cert>>();
         let mut server_certs = certs.iter().filter(|c| c.is_tsk());
-        let server_cert = server_certs.next().ok_or(anyhow::anyhow!("No server cert"))?.clone();
+        let server_cert = server_certs
+            .next()
+            .ok_or(anyhow::anyhow!("No server cert"))?
+            .clone();
         let client_certs = certs
             .into_iter()
             .filter(|c| c != &server_cert)
@@ -54,11 +58,7 @@ impl Helper {
         once(server_cert.clone())
             .chain(client_certs.iter().cloned())
             .for_each(|c| {
-                println!(
-                    "Loaded cert: {} {}",
-                    email(&c).unwrap_or("<no-email>"),
-                    c.fingerprint()
-                );
+                log::info!("Cert: {} {}", email(&c).unwrap_or("..."), c.fingerprint());
             });
         Ok(Self {
             server_cert,
@@ -121,7 +121,10 @@ impl Helper {
 
         let mut signing_key = signing_key;
         if !signing_key.has_unencrypted_secret() {
-            let p = self.password.as_ref().ok_or_else(|| Error::msg("Signing key is encrypted; set MSSH_PGP_PASSWORD"))?;
+            let p = self
+                .password
+                .as_ref()
+                .ok_or_else(|| Error::msg("Signing key is encrypted; set MSSH_PGP_PASSWORD"))?;
             signing_key = signing_key.decrypt_secret(p)?;
         }
 

@@ -1,10 +1,12 @@
-use std::io::{Write, Read};
+use std::io::{Read, Write};
 
+use nix::sys::termios::{SetArg, tcsetattr};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use std::os::fd::{BorrowedFd};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 pub struct Terminal {
-    child: Box<dyn portable_pty::Child + Send>,
+    _child: Box<dyn portable_pty::Child + Send>,
     reader: Option<Box<dyn Read + Send>>,
     writer: Box<dyn Write + Send>,
 }
@@ -18,17 +20,27 @@ impl Terminal {
             pixel_width: 0,
             pixel_height: 0,
         })?;
+        let mut termios = pair
+            .master
+            .get_termios()
+            .ok_or(anyhow::anyhow!("Termios missing"))?;
+        let echo_bits = nix::sys::termios::LocalFlags::ECHO
+            | nix::sys::termios::LocalFlags::ECHOE
+            | nix::sys::termios::LocalFlags::ECHOK
+            | nix::sys::termios::LocalFlags::ECHONL;
+        termios.local_flags.remove(echo_bits);
+        let raw_fd = pair.master.as_raw_fd().ok_or(anyhow::anyhow!(""))?;
+        let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+        tcsetattr(fd, SetArg::TCSANOW, &termios)?;
         let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.arg("-i");
         cmd.env("TERM", "dumb");
-        let child = pair.slave.spawn_command(cmd)?;
+        cmd.env("PS1", "");
+        let _child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
         let reader = pair.master.try_clone_reader()?;
-        let mut writer = pair.master.take_writer()?;
-        writer.write_all(b"stty -echo\n")?;
-        writer.flush()?;
+        let writer = pair.master.take_writer()?;
         Ok(Terminal {
-            child,
+            _child,
             reader: Some(reader),
             writer,
         })
