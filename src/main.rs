@@ -21,6 +21,7 @@ struct Config {
     pgp_keys_dir: String,
     pgp_password: Option<String>,
     tick_interval_seconds: u64,
+    pass_non_encrypted: bool,
 }
 
 #[tokio::main]
@@ -40,8 +41,11 @@ async fn main() -> Result<(), anyhow::Error> {
         config.proxy,
     )
     .await?;
-    let security =
-        security_layer::SecurityLayer::load(&config.pgp_keys_dir, config.pgp_password, true)?;
+    let security = security_layer::SecurityLayer::load(
+        &config.pgp_keys_dir,
+        config.pgp_password,
+        config.pass_non_encrypted,
+    )?;
     let mut dispatcher =
         dispatcher::Dispatcher::new(std::time::Duration::from_secs(config.tick_interval_seconds))?;
     let (t_in_tx, t_in_rx) = channel::<MessageFile>(128);
