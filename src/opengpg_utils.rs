@@ -134,6 +134,7 @@ impl Helper {
         let message_stream = Message::new(&mut sink);
         let message_stream = Armorer::new(message_stream).build()?;
         let message_stream = Encryptor::for_recipients(message_stream, recipients).build()?;
+        //let message_stream = Compressor::new(message_stream).build()?;
         let message_stream = Signer::new(message_stream, signing_key)?.build()?;
         let mut writer = LiteralWriter::new(message_stream).build()?;
 

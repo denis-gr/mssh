@@ -4,7 +4,7 @@ use crate::opengpg_utils::Helper;
 use bytes::Bytes;
 use log;
 use mail_builder::{headers::HeaderType, mime::MimePart};
-use mail_parser::{HeaderValue, MimeHeaders, PartType};
+use mail_parser::{MimeHeaders, PartType};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 pub struct SecurityLayer {
@@ -104,6 +104,7 @@ impl SecurityLayer {
             }
             return Ok(MessageFile {
                 client: real_addr[0].to_string(), // Always trust the decrypted From header
+                info: None,
                 message_file: Bytes::from(decrypted),
             });
         } else if typ == "multipart"
@@ -124,7 +125,7 @@ impl SecurityLayer {
     }
 
     fn encrypt(&self, msg: &MessageFile) -> Result<MessageFile, anyhow::Error> {
-        let encrypted = match self
+        let encrypted_bytes = match self
             .helper
             .encrypt_message(msg.message_file.as_ref(), msg.client.clone())
         {
@@ -138,64 +139,35 @@ impl SecurityLayer {
                 }
             }
         }?;
+        let encrypted = String::from_utf8(encrypted_bytes)?;
         log::info!("Encrypting message to {} (pgp-encrypted)", msg.client);
-        let mail = mail_parser::MessageParser::default()
-            .parse(msg.message_file.as_ref())
-            .ok_or_else(|| anyhow::anyhow!("Failed to parse encrypted message"))?;
-        let from = mail
-            .to()
-            .ok_or(anyhow::anyhow!("To header missing in encrypted message"))?
-            .iter()
-            .filter_map(|i| i.address())
-            .collect::<Vec<_>>();
-        if from.len() != 1 {
-            return Err(anyhow::anyhow!(
-                "Expected exactly one To address in encrypted message"
-            ));
-        }
-        let to = mail
-            .from()
-            .ok_or(anyhow::anyhow!("From header missing in decrypted message"))?
-            .iter()
-            .filter_map(|i| i.address())
-            .collect::<Vec<_>>();
-        if to.len() != 1 {
-            return Err(anyhow::anyhow!(
-                "Expected exactly one From address in decrypted message"
-            ));
-        }
-        let vec = encrypted.to_vec();
+        let info = msg.info.as_ref().unwrap().clone();
         let mut out_mail = mail_builder::MessageBuilder::new()
-            .from(to[0].to_string())
-            .to(from[0].to_string())
-            .subject(mail.subject().unwrap_or_else(|| "...".into()))
+            .from(info.from)
+            .to(info.to)
+            .subject(info.subject)
             .body(MimePart::new(
                 "multipart/encrypted; protocol=\"application/pgp-encrypted\"",
                 vec![
                     MimePart::new("application/pgp-encrypted", "Version: 1"),
-                    MimePart::new("application/octet-stream", str::from_utf8(&vec)?).header(
+                    MimePart::new("application/octet-stream", encrypted).header(
                         "Content-Disposition",
                         HeaderType::Text("attachment; filename=m.asc".into()),
                     ),
                 ],
             ));
-        if let HeaderValue::Address(addr) = mail.in_reply_to() {
-            let a = addr
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("In-Reply-To address list is empty"))?
-                .address()
-                .ok_or_else(|| anyhow::anyhow!("In-Reply-To address is not valid"))?;
-            out_mail = out_mail.in_reply_to(a);
+        if let Some(in_reply) = info.in_reply_to {
+            out_mail = out_mail.in_reply_to(in_reply);
         }
-        if let Some(header) = mail.header("References") {
-            let ref_text = header.as_text().unwrap_or("");
+        if let Some(reference) = info.reference {
             out_mail = out_mail.header(
                 "References",
-                mail_builder::headers::HeaderType::Text(ref_text.to_string().into()),
+                mail_builder::headers::HeaderType::Address(reference.into()),
             );
         }
         Ok(MessageFile {
             client: msg.client.clone(),
+            info: None,
             message_file: Bytes::from(out_mail.write_to_vec()?),
         })
     }

@@ -356,6 +356,7 @@ impl JmapTransport {
             log::info!("Downloading email from {}", item.from[0].email);
             tx.send(MessageFile {
                 client: item.from.last().unwrap().email.clone(), // len == 1
+                info: None,
                 message_file: Bytes::from(resp.bytes().await?),
             })
             .await?;

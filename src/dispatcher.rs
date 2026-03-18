@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 //pub use crate::echo::Echo;
-pub use crate::common::MessageFile;
+pub use crate::common::{MessageFile, MailInfo};
 pub use crate::terminal::Terminal as Echo;
 use bytes::Bytes;
 use mail_parser::PartType;
@@ -11,125 +11,116 @@ use tokio::sync::{
     mpsc::{Receiver, Sender, channel},
 };
 
-struct LastMailState {
-    subject: Option<String>,
-    client_message_id: Option<String>,
-    reference: Option<Vec<String>>,
-    in_reply_to: Option<String>,
-    body: Option<Vec<u8>>,
-}
-
-impl LastMailState {
-    fn from_bytes(bytes: &[u8]) -> Result<Self, anyhow::Error> {
-        let mail = mail_parser::MessageParser::default()
-            .parse(bytes)
-            .ok_or(anyhow::anyhow!("Failed to parse email message"))?;
-        let refs = mail
-            .references()
-            .as_address()
-            .and_then(|a| a.as_list())
-            .and_then(|l| {
-                l.iter()
-                    .map(|a| a.address().map(|s| s.to_string()))
-                    .collect::<Option<Vec<String>>>()
-            });
-        let body_idx = mail
-            .text_body
-            .first()
-            .ok_or(anyhow::anyhow!("No text body part"))?;
-        Ok(Self {
-            subject: mail.subject().map(|s| s.to_string()),
-            client_message_id: mail.message_id().map(|s| s.to_string()),
-            reference: refs,
-            in_reply_to: None,
-            body: match mail.part(body_idx.clone()) {
-                Some(part) => match &part.body {
-                    PartType::Text(t) => Some(t.as_bytes().to_vec()),
-                    _ => None,
+impl MailInfo {
+    fn from_bytes(bytes: Bytes) -> Result<(Bytes, MailInfo), anyhow::Error> {
+        let result = {
+            let mail = mail_parser::MessageParser::default()
+                .parse(bytes.as_ref())
+                .ok_or(anyhow::anyhow!("Failed to parse email message"))?;
+            let reference = mail
+                .references()
+                .as_address()
+                .and_then(|a| a.as_list())
+                .and_then(|l| {
+                    l.iter()
+                        .map(|a| a.address().map(|s| s.to_string()))
+                        .collect::<Option<Vec<String>>>()
+                });
+            let body_idx = mail
+                .text_body
+                .first()
+                .ok_or(anyhow::anyhow!("No text body part"))?;
+            let part = mail
+                .part(*body_idx)
+                .ok_or(anyhow::anyhow!("Failed to extract body"))?;
+            let body = match &part.body {
+                PartType::Text(cow) => match cow {
+                    Cow::Borrowed(s) => Bytes::copy_from_slice(s.as_bytes()),
+                    Cow::Owned(s) => Bytes::from(s.clone()),
                 },
-                None => None,
-            },
-        })
+                _ => return Err(anyhow::anyhow!("Unexpected body part type")),
+            };
+            let in_reply_to = mail
+                .in_reply_to()
+                .as_address()
+                .and_then(|a| a.as_list())
+                .and_then(|l| l.first().map(|a| a.address().map(|s| s.to_string())))
+                .flatten();
+            let from = mail
+                .from()
+                .and_then(|f| f.as_list())
+                .ok_or(anyhow::anyhow!("Failed to parse client emails"))?;
+            if from.len() != 1 {
+                return Err(anyhow::anyhow!("Found {} adresses in From", from.len()));
+            }
+            let from = from[0]
+                .address()
+                .map(|s| s.to_string())
+                .ok_or(anyhow::anyhow!("Failed to extract client email"))?;
+            let to = mail
+                .to()
+                .and_then(|t| t.as_list())
+                .ok_or(anyhow::anyhow!("Failed to parse server emails"))?;
+            if to.len() != 1 {
+                return Err(anyhow::anyhow!("Found {} adresses in To", to.len()));
+            }
+            let to = to[0]
+                .address()
+                .map(|s| s.to_string())
+                .ok_or(anyhow::anyhow!("Failed to extract server email"))?;
+
+            (
+                body,
+                Self {
+                    subject: mail.subject().unwrap_or("...").to_string(),
+                    message_id: mail.message_id().map(|s| s.to_string()),
+                    reference,
+                    in_reply_to,
+                    from,
+                    to,
+                },
+            )
+        };
+        return Ok(result);
     }
 
-    fn create_reply(&self, body: Vec<u8>) -> Self {
+    fn create_reply(self) -> Self {
         Self {
             subject: self.subject.clone(),
-            client_message_id: None,
+            message_id: None,
             reference: self.reference.clone(),
-            in_reply_to: self.client_message_id.clone(),
-            body: Some(body),
+            in_reply_to: self.message_id.clone(),
+            from: self.to,
+            to: self.from,
         }
     }
 
-    fn to_message_file(
-        &self,
-        client: String,
-        server: String,
-    ) -> Result<MessageFile, anyhow::Error> {
+    fn to_message_file(self, body: Bytes) -> Result<Bytes, anyhow::Error> {
         let mut mail = mail_builder::MessageBuilder::new()
-            .to(client.clone())
-            .from(server)
-            .subject(self.subject.clone().unwrap_or("...".to_string()))
-            .text_body(String::from_utf8_lossy(self.body.as_ref().unwrap_or(&vec![])).into_owned());
-
+            .to(self.to)
+            .from(self.from)
+            .subject(self.subject)
+            .text_body(String::from_utf8_lossy(body.as_ref()));
         if let Some(message_id) = &self.in_reply_to {
             mail = mail.in_reply_to(message_id.clone());
         }
         if let Some(reference) = &self.reference {
             mail = mail.references(reference.clone());
         }
-        Ok(MessageFile {
-            client: client,
-            message_file: Bytes::from(mail.write_to_vec()?),
-        })
+        Ok(Bytes::from(mail.write_to_vec()?))
     }
 }
 
 struct ClientContext {
     tr_in_tx: Sender<Vec<u8>>,
-    client: String,
-    server: String,
-    last_mail_state: Mutex<LastMailState>,
-}
-
-fn get_emails(msg: &[u8]) -> Result<(String, String), anyhow::Error> {
-    let mail = mail_parser::MessageParser::default()
-        .parse(msg)
-        .ok_or(anyhow::anyhow!("Failed to parse email message"))?;
-    let clients = mail
-        .from()
-        .and_then(|f| f.as_list())
-        .ok_or(anyhow::anyhow!("Failed to parse client emails"))?;
-    if clients.len() != 1 {
-        return Err(anyhow::anyhow!("Found {} adresses in From", clients.len()));
-    }
-    let client = clients[0]
-        .address()
-        .map(|s| s.to_string())
-        .ok_or(anyhow::anyhow!("Failed to extract client email"))?;
-    let servers = mail
-        .to()
-        .and_then(|t| t.as_list())
-        .ok_or(anyhow::anyhow!("Failed to parse server emails"))?;
-    if servers.len() != 1 {
-        return Err(anyhow::anyhow!("Found {} adresses in To", servers.len()));
-    }
-    let server = servers[0]
-        .address()
-        .map(|s| s.to_string())
-        .ok_or(anyhow::anyhow!("Failed to extract server email"))?;
-    Ok((client, server))
+    last_mail: Mutex<Option<MailInfo>>,
 }
 
 impl ClientContext {
     pub fn create(
-        msg: MessageFile,
         out_tx: Sender<MessageFile>,
         tick_interval: std::time::Duration,
     ) -> Result<Arc<Self>, anyhow::Error> {
-        log::info!("Creating context for client {}", msg.client);
-        let (client, server) = get_emails(&msg.message_file.as_ref())?;
         let (tr_in_tx, tr_in_rx) = channel::<Vec<u8>>(128);
         let (tr_out_tx, mut tr_out_rx) = channel::<Vec<u8>>(128);
         let mut tr = Echo::new()?;
@@ -140,15 +131,7 @@ impl ClientContext {
 
         let context = Arc::new(Self {
             tr_in_tx,
-            client,
-            server,
-            last_mail_state: Mutex::new(LastMailState {
-                subject: None,
-                client_message_id: None,
-                reference: None,
-                body: None,
-                in_reply_to: None,
-            }),
+            last_mail: Mutex::new(None),
         });
 
         let context2 = Arc::clone(&context);
@@ -166,7 +149,6 @@ impl ClientContext {
                         if !buffer.is_empty() {
                             let mes = context2.send_from_tr(buffer).await;
                             if out_tx.send(mes).await.is_err() {
-                                log::info!("Output channel closed for client {}", context2.client);
                                 break;
                             }
                             buffer = Vec::new();
@@ -178,22 +160,30 @@ impl ClientContext {
         Ok(context)
     }
 
-    async fn send_from_tr(&self, mes: Vec<u8>) -> MessageFile {
-        log::info!("New data from thread for client {}", self.client);
-        let mes = self.last_mail_state.lock().await.create_reply(mes);
-        mes.to_message_file(self.client.clone(), self.server.clone())
-            .unwrap()
+    async fn send_from_tr(&self, buf: Vec<u8>) -> MessageFile {
+        let last_mail = self.last_mail.lock().await;
+        let info = last_mail
+            .as_ref()
+            .expect("No mail received yet, but terminal sent data");
+        let reply_info = info.clone().create_reply();
+        let message_file = reply_info.clone()
+            .to_message_file(Bytes::from(buf))
+            .unwrap_or_else(|e| {
+                panic!("Failed to create message file from terminal data: {}", e);
+            });
+        MessageFile {
+            message_file,
+            info: Some(reply_info),
+            client: info.from.clone(), // is reply_info.to
+        }
     }
 
-    pub async fn send_to_tr(&self, mes: MessageFile) {
-        log::info!("New data for thread for client {}", self.client);
-        let state = LastMailState::from_bytes(&mes.message_file.as_ref()).unwrap();
-        let body = state.body.clone().unwrap_or_default();
-        {
-            let mut state_lock = self.last_mail_state.lock().await;
-            *state_lock = state;
-        }
-        let _ = self.tr_in_tx.send(body).await;
+    pub async fn send_to_tr(&self, mes: Bytes, info: MailInfo) {
+        let mut last_mail = self.last_mail.lock().await;
+        *last_mail = Some(info);
+        self.tr_in_tx.send(mes.to_vec()).await.unwrap_or_else(|e| {
+            log::error!("Failed to send data to terminal: {}", e);
+        });
     }
 }
 
@@ -216,11 +206,12 @@ impl Dispatcher {
         mut in_rx: Receiver<MessageFile>,
     ) -> Result<(), anyhow::Error> {
         while let Some(msg) = in_rx.recv().await {
-            let client = msg.client.clone();
-            let context = self.clients.entry(client.clone()).or_insert_with(|| {
-                ClientContext::create(msg.clone(), out_tx.clone(), self.tick_interval).unwrap()
+            let (bytes, info) = MailInfo::from_bytes(msg.message_file)?;
+            let context = self.clients.entry(info.from.clone()).or_insert_with(|| {
+                ClientContext::create(out_tx.clone(), self.tick_interval)
+                    .unwrap_or_else(|e| panic!("Failed to create client context: {}", e))
             });
-            context.send_to_tr(msg).await;
+            context.send_to_tr(bytes, info).await;
         }
         Ok(())
     }

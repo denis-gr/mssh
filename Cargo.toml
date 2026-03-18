@@ -25,9 +25,11 @@ toml = { version = "1.0", default-features = false, features = [
 ] }
 sequoia-openpgp = { version = "2", default-features = false, features = [
     "crypto-openssl",
+    "compression",
 ] }
 portable-pty = { version = "0.9", default-features = false }
 log = { version = "0.4.29", features = ["std"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 nix = { version = "0.28", features = ["term"] }
 bytes = "1.11.1"
+dhat = "0.3.3"
