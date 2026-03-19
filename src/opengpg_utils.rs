@@ -84,8 +84,9 @@ impl Helper {
         let mut decryptor =
             DecryptorBuilder::from_bytes(message)?.with_policy(&policy, None, helper)?;
 
-        let mut decrypted_message = Vec::new();
+        let mut decrypted_message = Vec::with_capacity(message.len() + 4096);
         decryptor.read_to_end(&mut decrypted_message)?;
+        decrypted_message.shrink_to_fit();
 
         Ok(decrypted_message)
     }
@@ -130,7 +131,7 @@ impl Helper {
 
         let signing_key = signing_key.into_keypair()?;
 
-        let mut sink = Vec::new();
+        let mut sink = Vec::with_capacity((message.len() as f64 * 1.37) as usize + 4096);
         let message_stream = Message::new(&mut sink);
         let message_stream = Armorer::new(message_stream).build()?;
         let message_stream = Encryptor::for_recipients(message_stream, recipients).build()?;
@@ -138,8 +139,12 @@ impl Helper {
         let message_stream = Signer::new(message_stream, signing_key)?.build()?;
         let mut writer = LiteralWriter::new(message_stream).build()?;
 
-        writer.write_all(message)?;
+        for chunk in message.chunks(8192) {
+            writer.write_all(chunk)?;
+        }
+
         writer.finalize()?;
+        sink.shrink_to_fit();
 
         Ok(sink)
     }

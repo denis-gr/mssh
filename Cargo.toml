@@ -33,3 +33,5 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 nix = { version = "0.28", features = ["term"] }
 bytes = "1.11.1"
 dhat = "0.3.3"
+uuid = { version = "1.22.0", features = ["v4"] }
+chrono = "0.4.44"

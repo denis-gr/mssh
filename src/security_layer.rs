@@ -3,8 +3,8 @@ use crate::opengpg_utils::Helper;
 
 use bytes::Bytes;
 use log;
-use mail_builder::{headers::HeaderType, mime::MimePart};
 use mail_parser::{MimeHeaders, PartType};
+use std::io::Write;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 pub struct SecurityLayer {
@@ -34,7 +34,7 @@ impl SecurityLayer {
         loop {
             tokio::select! {
                 Some(msg) = in_rx.recv() => {
-                    match self.decrypt(&msg) {
+                    match self.decrypt(msg) {
                         Ok(decrypted) => out_tx.send(decrypted).await?,
                         Err(e) => {
                             log::error!("Decryption failed: {}", e);
@@ -42,7 +42,7 @@ impl SecurityLayer {
                     }
                 }
                 Some(msg) = out_rx.recv() => {
-                    match self.encrypt(&msg) {
+                    match self.encrypt(msg) {
                         Ok(encrypted) => in_tx.send(encrypted).await?,
                         Err(e) => {
                             log::error!("Encryption failed: {}", e);
@@ -53,7 +53,7 @@ impl SecurityLayer {
         }
     }
 
-    fn decrypt(&self, mes: &MessageFile) -> Result<MessageFile, anyhow::Error> {
+    fn decrypt(&self, mes: MessageFile) -> Result<MessageFile, anyhow::Error> {
         let mail = mail_parser::MessageParser::default()
             .parse(mes.message_file.as_ref())
             .ok_or_else(|| anyhow::anyhow!("Failed to parse email message"))?;
@@ -79,15 +79,16 @@ impl SecurityLayer {
                 })
                 .ok_or_else(|| anyhow::anyhow!("Encrypted part not found"))?;
             let content = match part.body {
-                PartType::Text(ref text) => Bytes::copy_from_slice(text.as_bytes()),
-                PartType::Binary(ref data) => Bytes::copy_from_slice(data.as_ref()),
+                PartType::Text(ref text) => text.as_bytes(),
+                PartType::Binary(ref data) => data.as_ref(),
                 _ => {
                     return Err(anyhow::anyhow!(
                         "Unsupported content type in encrypted part"
                     ));
                 }
             };
-            let decrypted = self.helper.decrypt_message(content.as_ref())?;
+            let decrypted = self.helper.decrypt_message(content)?;
+            drop(mes);
             let inner_mail = mail_parser::MessageParser::default()
                 .parse(&decrypted)
                 .ok_or_else(|| anyhow::anyhow!("Failed to parse decrypted message"))?;
@@ -124,7 +125,7 @@ impl SecurityLayer {
         }
     }
 
-    fn encrypt(&self, msg: &MessageFile) -> Result<MessageFile, anyhow::Error> {
+    fn encrypt(&self, msg: MessageFile) -> Result<MessageFile, anyhow::Error> {
         let encrypted_bytes = match self
             .helper
             .encrypt_message(msg.message_file.as_ref(), msg.client.clone())
@@ -140,35 +141,68 @@ impl SecurityLayer {
             }
         }?;
         let encrypted = String::from_utf8(encrypted_bytes)?;
+        let encrypted_len = encrypted.len();
         log::info!("Encrypting message to {} (pgp-encrypted)", msg.client);
         let info = msg.info.as_ref().unwrap().clone();
-        let mut out_mail = mail_builder::MessageBuilder::new()
-            .from(info.from)
-            .to(info.to)
-            .subject(info.subject)
-            .body(MimePart::new(
-                "multipart/encrypted; protocol=\"application/pgp-encrypted\"",
-                vec![
-                    MimePart::new("application/pgp-encrypted", "Version: 1"),
-                    MimePart::new("application/octet-stream", encrypted).header(
-                        "Content-Disposition",
-                        HeaderType::Text("attachment; filename=m.asc".into()),
-                    ),
-                ],
-            ));
+        let client = msg.client.clone();
+        drop(msg);
+        let mut buf = Vec::with_capacity(encrypted_len + 2048);
+        let boundary = "mssh-pgp-boundary";
+        write!(buf, "From: <{}>\r\n", info.from)?;
+        write!(buf, "To: <{}>\r\n", info.to)?;
+        write!(buf, "Subject: {}\r\n", info.subject)?;
+        write!(buf, "MIME-Version: 1.0\r\n")?;
+        write!(buf, "Date: {}\r\n", chrono::Utc::now().to_rfc2822())?;
+        let from_domain = info
+            .from
+            .split('@')
+            .nth(1)
+            .ok_or_else(|| anyhow::anyhow!("Invalid from email address"))?;
+        write!(
+            buf,
+            "Message-ID: <{}@{}>\r\n",
+            uuid::Uuid::new_v4(),
+            from_domain
+        )?;
         if let Some(in_reply) = info.in_reply_to {
-            out_mail = out_mail.in_reply_to(in_reply);
+            write!(buf, "In-Reply-To: <{}>\r\n", in_reply)?;
         }
         if let Some(reference) = info.reference {
-            out_mail = out_mail.header(
-                "References",
-                mail_builder::headers::HeaderType::Address(reference.into()),
-            );
+            let reference = reference
+                .iter()
+                .map(|s| format!("<{}>", s))
+                .collect::<Vec<_>>()
+                .join("\r\n ");
+            write!(buf, "References: {}\r\n", reference)?;
         }
+        write!(
+            buf,
+            "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\";\r\n boundary=\"{}\"\r\n",
+            boundary
+        )?;
+        write!(buf, "\r\n")?;
+        write!(buf, "--{}\r\n", boundary)?;
+        write!(buf, "Content-Type: application/pgp-encrypted\r\n")?;
+        write!(buf, "\r\n")?;
+        write!(buf, "Version: 1\r\n")?;
+        write!(buf, "\r\n")?;
+        write!(buf, "--{}\r\n", boundary)?;
+        write!(
+            buf,
+            "Content-Type: application/octet-stream; name=\"m.asc\"\r\n"
+        )?;
+        write!(
+            buf,
+            "Content-Disposition: attachment; filename=\"m.asc\"\r\n"
+        )?;
+        write!(buf, "\r\n")?;
+        write!(buf, "{}", encrypted)?;
+        write!(buf, "\r\n--{}--\r\n", boundary)?;
+        buf.shrink_to_fit();
         Ok(MessageFile {
-            client: msg.client.clone(),
+            client: client,
             info: None,
-            message_file: Bytes::from(out_mail.write_to_vec()?),
+            message_file: Bytes::from(buf),
         })
     }
 }

@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::HashMap};
 
 //pub use crate::echo::Echo;
-pub use crate::common::{MessageFile, MailInfo};
+pub use crate::common::{MailInfo, MessageFile};
 pub use crate::terminal::Terminal as Echo;
 use bytes::Bytes;
 use mail_parser::PartType;
@@ -107,7 +107,10 @@ impl MailInfo {
         if let Some(reference) = &self.reference {
             mail = mail.references(reference.clone());
         }
-        Ok(Bytes::from(mail.write_to_vec()?))
+        let mut buf = Vec::with_capacity((body.len() as f64 * 1.37) as usize + 1024);
+        mail.write_to(&mut buf)?;
+        buf.shrink_to_fit();
+        Ok(Bytes::from(buf))
     }
 }
 
@@ -166,7 +169,8 @@ impl ClientContext {
             .as_ref()
             .expect("No mail received yet, but terminal sent data");
         let reply_info = info.clone().create_reply();
-        let message_file = reply_info.clone()
+        let message_file = reply_info
+            .clone()
             .to_message_file(Bytes::from(buf))
             .unwrap_or_else(|e| {
                 panic!("Failed to create message file from terminal data: {}", e);

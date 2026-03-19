@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 
 use nix::sys::termios::{SetArg, tcsetattr};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
-use std::os::fd::{BorrowedFd};
+use std::os::fd::BorrowedFd;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 pub struct Terminal {
