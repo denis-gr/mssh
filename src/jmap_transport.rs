@@ -41,6 +41,32 @@ struct UploadResponse {
     blob_id: String,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+struct IdentityResponseItem {
+    id: String,
+    email: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+struct IdentityResponse {
+    list: Vec<IdentityResponseItem>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FolderResponseItem {
+    id: String,
+    role: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FolderResponse {
+    list: Vec<FolderResponseItem>,
+}
+
 fn find_response(json_value: &Value) -> Result<&Value, anyhow::Error> {
     json_value
         .get("methodResponses")
@@ -58,40 +84,20 @@ fn find_response(json_value: &Value) -> Result<&Value, anyhow::Error> {
 }
 
 fn get_identity(json: &Value, email: &str) -> Result<String, anyhow::Error> {
-    find_response(json)?
-        .get("list")
-        .and_then(|list| list.as_array())
-        .and_then(|arr| {
-            arr.iter().find_map(|item| {
-                item.get("email")
-                    .and_then(|e| e.as_str())
-                    .filter(|&e| e == email)
-                    .and_then(|_| {
-                        item.get("id")
-                            .and_then(|id| id.as_str())
-                            .map(|s| s.to_string())
-                    })
-            })
-        })
-        .ok_or(anyhow!("No identity found for email: {}", email))
+    serde_json::from_value::<IdentityResponse>(find_response(&json)?.clone())?
+        .list
+        .into_iter()
+        .find(|item| item.email == email)
+        .map(|item| item.id)
+        .ok_or_else(|| anyhow!("No identity found for email: {}", email))
 }
 
 fn get_folder(json: &Value, role: &str) -> Result<String, anyhow::Error> {
-    find_response(json)?
-        .get("list")
-        .and_then(|list| list.as_array())
-        .and_then(|arr| {
-            arr.iter().find_map(|item| {
-                item.get("role")
-                    .and_then(|r| r.as_str())
-                    .filter(|&r| r == role)
-                    .and_then(|_| {
-                        item.get("id")
-                            .and_then(|id| id.as_str())
-                            .map(|s| s.to_string())
-                    })
-            })
-        })
+    serde_json::from_value::<FolderResponse>(find_response(&json)?.clone())?
+        .list
+        .into_iter()
+        .find(|item| item.role == role)
+        .map(|item| item.id)
         .ok_or_else(|| anyhow!("No folder found for role: {}", role))
 }
 
