@@ -143,7 +143,7 @@ impl SecurityLayer {
         let info = msg.info.as_ref().unwrap().clone();
         let client = msg.client.clone();
         drop(msg);
-        let mut b = Vec::with_capacity(encrypted_len + 2048);
+        let mut b = Vec::with_capacity(encrypted_len + 1024);
         let boundary = "mssh-pgp-boundary";
         let domain = info.from.split('@').nth(1);
         let domain = domain.ok_or(anyhow!("Invalid from email address"))?;

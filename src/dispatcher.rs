@@ -107,7 +107,7 @@ impl MailInfo {
         if let Some(reference) = &self.reference {
             mail = mail.references(reference.clone());
         }
-        let mut buf = Vec::with_capacity((body.len() as f64 * 1.37) as usize + 1024);
+        let mut buf = Vec::with_capacity((body.len() + 2) / 3 * 4 + 1024);
         mail.write_to(&mut buf)?;
         buf.shrink_to_fit();
         Ok(Bytes::from(buf))

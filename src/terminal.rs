@@ -12,7 +12,7 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(_arg: String) -> anyhow::Result<Self> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system.openpty(PtySize {
             rows: 24,
@@ -54,7 +54,7 @@ impl Terminal {
             .take()
             .expect("Terminal reader should exist when run() is called");
 
-        std::thread::spawn(move || {
+        tokio::task::spawn_blocking(move || {
             let mut buffer = [0u8; 4096];
             loop {
                 match reader.read(&mut buffer) {
@@ -85,5 +85,12 @@ impl Terminal {
                 }
             }
         }
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        let _ = self._child.kill();
+        let _ = self._child.wait();
     }
 }

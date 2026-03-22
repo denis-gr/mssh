@@ -3,7 +3,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 pub struct Echo {}
 
 impl Echo {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(_arg: String) -> anyhow::Result<Self> {
         Ok(Echo {})
     }
 
