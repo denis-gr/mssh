@@ -19,7 +19,7 @@ impl SecurityLayer {
     ) -> Result<Self, anyhow::Error> {
         Ok(Self {
             h: Helper::load_dir(path, pgp_password)?,
-            pass_raw: pass_raw,
+            pass_raw,
         })
     }
 
@@ -68,21 +68,21 @@ impl SecurityLayer {
                     "Expected exactly one From address in decrypted message"
                 ));
             }
-            return Ok(MessageFile {
+            Ok(MessageFile {
                 client: real_addr[0].to_string(), // Always trust the decrypted From header
                 info: None,
                 file: Bytes::from(decrypted),
-            });
+            })
         } else if typ == "multipart"
             && subtyp == "signed"
             && protocol == Some("application/pgp-signature")
         {
             // TODO: support signed messages
-            return Err(anyhow!("Signed messages are not supported"));
+            Err(anyhow!("Signed messages are not supported"))
         } else if self.pass_raw {
-            return Ok(mes.clone());
+            Ok(mes.clone())
         } else {
-            return Err(anyhow!("Message unencrypted/unsigned and !pass_raw"));
+            Err(anyhow!("Message unencrypted/unsigned and !pass_raw"))
         }
     }
 
@@ -128,7 +128,7 @@ impl SecurityLayer {
         write!(b, "\r\n--{}--\r\n", boundary)?;
         b.shrink_to_fit();
         Ok(MessageFile {
-            client: client,
+            client,
             info: None,
             file: Bytes::from(b),
         })

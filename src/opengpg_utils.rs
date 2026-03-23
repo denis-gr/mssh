@@ -4,7 +4,6 @@ use sequoia_openpgp::serialize::stream::Armorer;
 use sequoia_openpgp::serialize::stream::Signer;
 use sequoia_openpgp::{self as openpgp};
 
-use log;
 use openpgp::crypto::{Password, SessionKey};
 use openpgp::parse::Parse;
 use openpgp::parse::stream::{
@@ -24,9 +23,7 @@ use anyhow::anyhow;
 use std::collections::HashMap;
 
 fn email(cert: &Cert) -> Option<&str> {
-    cert.userids()
-        .next()
-        .and_then(|u| Some(u.userid().email().ok()??))
+    cert.userids().next().and_then(|u| u.userid().email().ok()?)
 }
 
 #[derive(Clone)]
@@ -130,7 +127,7 @@ impl Helper {
 
         let signing_key = signing_key.into_keypair()?;
 
-        let mut sink = Vec::with_capacity((message.len() + 2) / 3 * 4 + 256);
+        let mut sink = Vec::with_capacity(message.len().div_ceil(3) * 4 + 256);
         let message_stream = Message::new(&mut sink);
         let message_stream = Armorer::new(message_stream).build()?;
         let message_stream = Encryptor::for_recipients(message_stream, recipients).build()?;

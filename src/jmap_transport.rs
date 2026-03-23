@@ -10,7 +10,6 @@ use isahc::auth::{Authentication, Credentials};
 use isahc::config::RedirectPolicy;
 use isahc::http::Uri;
 use isahc::{HttpClient, prelude::*};
-use log;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -85,7 +84,7 @@ fn find_response(json_value: &Value) -> Result<&Value, anyhow::Error> {
 }
 
 fn get_identity(json: &Value, email: &str) -> Result<String, anyhow::Error> {
-    serde_json::from_value::<IdentityResponse>(find_response(&json)?.clone())?
+    serde_json::from_value::<IdentityResponse>(find_response(json)?.clone())?
         .list
         .into_iter()
         .find(|item| item.email == email)
@@ -94,7 +93,7 @@ fn get_identity(json: &Value, email: &str) -> Result<String, anyhow::Error> {
 }
 
 fn get_folder(json: &Value, role: &str) -> Result<String, anyhow::Error> {
-    serde_json::from_value::<FolderResponse>(find_response(&json)?.clone())?
+    serde_json::from_value::<FolderResponse>(find_response(json)?.clone())?
         .list
         .into_iter()
         .find(|item| item.role == role)
@@ -289,28 +288,45 @@ impl JmapTransport {
         out: Sender<MessageFile>,
         mut inc: Receiver<MessageFile>,
     ) -> Result<(), anyhow::Error> {
-        let url = self.params.event_source_url.clone();
-        let sse_response = self.client.get_async(&url).await?;
-        let mut sse_reader = decode(BufReader::new(sse_response.into_body()));
+        let mut reconnect_delay = std::time::Duration::from_secs(1);
+        let max_reconnect_delay = std::time::Duration::from_secs(60);
         loop {
-            tokio::select! {
-                Some(msg) = inc.recv() => if let Err(e) = self.send_message(msg).await {
-                    log::error!("Failed to send message: {e}");
-                } else {
-                    log::debug!("Message sent successfully");
-                },
-                Some(event) = sse_reader.next() => match event {
-                    Ok(async_sse::Event::Message(m)) if m.name() == "state" => {
-                        if let Err(e) = self.download_messages(&out).await {
-                            log::error!("Failed to download messages: {e}");
-                        } else {
-                            log::debug!("Messages downloaded successfully");
+            let url = self.params.event_source_url.clone();
+            let sse_response = match self.client.get_async(&url).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    log::error!("Failed to connect to SSE: {e}");
+                    tokio::time::sleep(reconnect_delay).await;
+                    reconnect_delay = (reconnect_delay * 2).min(max_reconnect_delay);
+                    continue;
+                }
+            };
+            let mut sse_reader = decode(BufReader::new(sse_response.into_body()));
+            loop {
+                tokio::select! {
+                    Some(msg) = inc.recv() => if let Err(e) = self.send_message(msg).await {
+                        log::error!("Failed to send message: {e}");
+                    } else {
+                        log::debug!("Message sent successfully");
+                    },
+                    Some(event) = sse_reader.next() => match event {
+                        Ok(async_sse::Event::Message(m)) if m.name() == "state" => {
+                            if let Err(e) = self.download_messages(&out).await {
+                                log::error!("Failed to download messages: {e}");
+                            } else {
+                                log::debug!("Messages downloaded successfully");
+                            }
                         }
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::error!("Error reading SSE: {e}");
+                            break;
+                        },
                     }
-                    Err(e) => log::error!("Error reading SSE: {e}"),
-                    _ => {}
                 }
             }
+            tokio::time::sleep(reconnect_delay).await;
+            reconnect_delay = (reconnect_delay * 2).min(max_reconnect_delay);
         }
     }
 
@@ -340,7 +356,6 @@ impl JmapTransport {
         let json = r.json::<Value>().await?;
         let val = find_response(&json)?.clone();
         let resp = serde_json::from_value::<EmailGetResponse>(val)?;
-        self.last_sse_state = resp.state;
         let url_template = self.params.download_url.clone();
         for item in resp.list {
             if item.from.len() != 1 {
@@ -364,6 +379,7 @@ impl JmapTransport {
             }
             tx.send(msg).await?;
         }
+        self.last_sse_state = resp.state;
         Ok(())
     }
 }

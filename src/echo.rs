@@ -7,7 +7,7 @@ impl Echo {
         Ok(Echo {})
     }
 
-    pub async fn run(&mut self, out_tx: Sender<Vec<u8>>, mut in_rx: Receiver<Vec<u8>>) {
+    pub async fn run(&self, out_tx: Sender<Vec<u8>>, mut in_rx: Receiver<Vec<u8>>) {
         while let Some(msg) = in_rx.recv().await {
             if out_tx.send(msg).await.is_err() {
                 break;

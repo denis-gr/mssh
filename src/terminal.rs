@@ -39,7 +39,7 @@ impl Terminal {
         drop(pair.slave);
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
-        Ok(Terminal {
+        Ok(Self {
             _child,
             reader: Some(reader),
             writer,

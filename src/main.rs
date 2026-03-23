@@ -1,6 +1,7 @@
 mod common;
 mod dispatcher;
-//mod echo;
+mod echo;
+mod subsystem;
 mod jmap_transport;
 mod opengpg_utils;
 mod security_layer;
@@ -12,6 +13,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::common::MessageFile;
 
+#[cfg(feature = "profiling")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
@@ -29,7 +31,9 @@ struct Config {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    #[cfg(feature = "profiling")]
     let _profiler = dhat::Profiler::new_heap();
+
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(EnvFilter::new("info,mssh=trace"))
