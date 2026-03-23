@@ -18,7 +18,7 @@ pub struct MessageFile {
     pub client: String,
     //server: String,
     pub info: Option<MailInfo>,
-    pub message_file: Bytes,
+    pub file: Bytes,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +121,7 @@ impl MailInfo {
                     subject_parts[2]
                 );
             }
+            let id = id.map(|i| i.replace("#", ""));
             if let Some(ref typ_val) = typ {
                 arg = arg.replacen(typ_val, "", 1);
             }
@@ -157,7 +158,7 @@ impl MailInfo {
         }
     }
 
-    pub fn to_message_file(self, body: Bytes) -> Result<Bytes, anyhow::Error> {
+    pub fn to_file(self, body: Bytes) -> Result<Bytes, anyhow::Error> {
         let mut mail = mail_builder::MessageBuilder::new()
             .to(self.to)
             .from(self.from)

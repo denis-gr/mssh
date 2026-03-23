@@ -1,4 +1,5 @@
 use crate::common::MessageFile;
+use crate::security_layer;
 use anyhow::anyhow;
 use async_sse::decode;
 use bytes::Bytes;
@@ -13,7 +14,7 @@ use log;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -204,13 +205,14 @@ impl JmapSettings {
 }
 
 pub struct JmapTransport {
-    jmap_session: JmapSettings,
+    params: JmapSettings,
     client: HttpClient,
     last_sse_state: String,
     iid: String,
     fid: String,
     aid: String,
     email: String,
+    security: Option<security_layer::SecurityLayer>,
 }
 
 impl JmapTransport {
@@ -264,108 +266,103 @@ impl JmapTransport {
         let fid = get_folder(&response.json::<Value>().await?, "sent")?;
 
         Ok(Self {
-            jmap_session: settings,
+            params: settings,
             client,
             last_sse_state,
             iid,
             fid,
             aid,
             email: email.to_string(),
+            security: None,
         })
+    }
+
+    pub fn set_security_layer(self, security: security_layer::SecurityLayer) -> Self {
+        Self {
+            security: Some(security),
+            ..self
+        }
     }
 
     pub async fn run(
         mut self,
-        outgoing: mpsc::Sender<MessageFile>,
-        mut incoming: mpsc::Receiver<MessageFile>,
+        out: Sender<MessageFile>,
+        mut inc: Receiver<MessageFile>,
     ) -> Result<(), anyhow::Error> {
-        let sse_response = self
-            .client
-            .get_async(self.jmap_session.event_source_url.clone())
-            .await?;
-        let reader = BufReader::new(sse_response.into_body());
-        let mut sse_reader = decode(reader);
+        let url = self.params.event_source_url.clone();
+        let sse_response = self.client.get_async(&url).await?;
+        let mut sse_reader = decode(BufReader::new(sse_response.into_body()));
         loop {
             tokio::select! {
-                Some(msg) = incoming.recv() => {
-                    log::info!("Sending email to {}", msg.client);
-                    self.send_message(msg).await?;
-                }
-                event = sse_reader.next() => {
-                    match event {
-                        Some(Ok(async_sse::Event::Message(msg))) => {
-                            if msg.name() != "state" {
-                                continue;
-                            }
-                            log::info!("New SSE state");
-                            self.download_messages(&outgoing).await?;
+                Some(msg) = inc.recv() => if let Err(e) = self.send_message(msg).await {
+                    log::error!("Failed to send message: {e}");
+                } else {
+                    log::debug!("Message sent successfully");
+                },
+                Some(event) = sse_reader.next() => match event {
+                    Ok(async_sse::Event::Message(m)) if m.name() == "state" => {
+                        if let Err(e) = self.download_messages(&out).await {
+                            log::error!("Failed to download messages: {e}");
+                        } else {
+                            log::debug!("Messages downloaded successfully");
                         }
-                        Some(Err(e)) => {
-                            log::warn!("Error reading SSE: {}", e);
-                        }
-                        _ => {}
                     }
+                    Err(e) => log::error!("Error reading SSE: {e}"),
+                    _ => {}
                 }
             }
         }
     }
 
     async fn send_message(&self, msg: MessageFile) -> Result<(), anyhow::Error> {
-        let settings = &self.jmap_session;
-        let mut response = self
-            .client
-            .post_async(&settings.upload_url, msg.message_file.as_ref())
-            .await?;
+        let mut msg = msg;
+        if let Some(security) = &self.security {
+            msg = security.encrypt(msg)?;
+            log::debug!("Message encrypted successfully");
+        }
+        let upload_url = self.params.upload_url.clone();
+        let body = msg.file.as_ref();
+        let mut response = self.client.post_async(&upload_url, body).await?;
         let upload_resp = response.json::<UploadResponse>().await?;
         let new_blob_id = upload_resp.blob_id;
-        let mut response = self
-            .client
-            .post_async(
-                &settings.api_url,
-                get_send_blob_as_email_request(&self.aid, &self.iid, &self.fid, &new_blob_id),
-            )
-            .await?;
+        let body = get_send_blob_as_email_request(&self.aid, &self.iid, &self.fid, &new_blob_id);
+        let mut response = self.client.post_async(&self.params.api_url, body).await?;
         let val: Value = response.json().await?;
-        if let Some(not_created) = find_response(&val)?.get("notCreated") {
-            log::warn!("Failed to send email: {}", not_created);
-        } else {
-            log::info!("Email sent successfully");
+        if let Some(err) = find_response(&val)?.get("notCreated") {
+            return Err(anyhow!("Failed to send email: {:?}", err));
         }
         Ok(())
     }
 
-    async fn download_messages(
-        &mut self,
-        tx: &mpsc::Sender<MessageFile>,
-    ) -> Result<(), anyhow::Error> {
-        let mut r = self
-            .client
-            .post_async(
-                &self.jmap_session.api_url,
-                get_new_mes_request(&self.aid, &self.last_sse_state),
-            )
-            .await?;
+    async fn download_messages(&mut self, tx: &Sender<MessageFile>) -> Result<(), anyhow::Error> {
+        let body = get_new_mes_request(&self.aid, &self.last_sse_state);
+        let mut r = self.client.post_async(&self.params.api_url, body).await?;
         let json = r.json::<Value>().await?;
         let val = find_response(&json)?.clone();
         let resp = serde_json::from_value::<EmailGetResponse>(val)?;
         self.last_sse_state = resp.state;
-        let url_template = self.jmap_session.download_url.clone();
+        let url_template = self.params.download_url.clone();
         for item in resp.list {
             if item.from.len() != 1 {
+                log::debug!("Skipping email with multiple from: {:?}", item.from);
                 continue;
             }
             if item.from[0].email == self.email {
+                log::debug!("Skipping email from self: {:?}", item.from);
                 continue;
             }
             let url = url_template.replace("{blobId}", &item.blob_id);
             let mut resp = self.client.get_async(&url).await?;
-            log::info!("Downloading email from {}", item.from[0].email);
-            tx.send(MessageFile {
-                client: item.from.last().unwrap().email.clone(), // len == 1
+            let mut msg = MessageFile {
+                client: item.from[0].email.clone(),
                 info: None,
-                message_file: Bytes::from(resp.bytes().await?),
-            })
-            .await?;
+                file: Bytes::from(resp.bytes().await?),
+            };
+            if let Some(security) = &self.security {
+                msg = security.decrypt(msg)?;
+                log::debug!("Message decrypted successfully");
+            }
+            tx.send(msg).await?;
         }
         Ok(())
     }

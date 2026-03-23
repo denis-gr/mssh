@@ -79,10 +79,9 @@ impl Helper {
 
     pub fn decrypt_message(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
         let policy = StandardPolicy::new();
-        let helper: Helper = self.clone();
+        let h: Helper = self.clone();
 
-        let mut decryptor =
-            DecryptorBuilder::from_bytes(message)?.with_policy(&policy, None, helper)?;
+        let mut decryptor = DecryptorBuilder::from_bytes(message)?.with_policy(&policy, None, h)?;
 
         let mut decrypted_message = Vec::with_capacity(message.len());
         decryptor.read_to_end(&mut decrypted_message)?;

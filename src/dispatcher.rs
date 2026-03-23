@@ -27,17 +27,14 @@ impl ClientContext {
         let (tr_in_tx, tr_in_rx) = channel::<Vec<u8>>(128);
         let (tr_out_tx, mut tr_out_rx) = channel::<Vec<u8>>(128);
         let mut tr = Terminal::new("".to_string())?;
-
         let jh = tokio::spawn(async move {
             tr.run(tr_out_tx, tr_in_rx).await;
         });
-
         let context = Arc::new(Self {
             jh,
             tr_in_tx,
             last_mail: Mutex::new(None),
         });
-
         let context2 = Arc::clone(&context);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(tick_interval);
@@ -70,25 +67,22 @@ impl ClientContext {
             .as_ref()
             .expect("No mail received yet, but terminal sent data");
         let reply_info = info.clone().create_reply();
-        let message_file = reply_info
+        let file = reply_info
             .clone()
-            .to_message_file(Bytes::from(buf))
-            .unwrap_or_else(|e| {
-                panic!("Failed to create message file from terminal data: {}", e);
-            });
+            .to_file(Bytes::from(buf))
+            .expect("Failed to create message file from terminal data");
         MessageFile {
-            message_file,
+            file,
             info: Some(reply_info),
             client: info.from.clone(), // is reply_info.to
         }
     }
 
-    pub async fn send_to_tr(&self, mes: Bytes, info: MailInfo) {
+    pub async fn send_to_tr(&self, mes: Bytes, info: MailInfo) -> Result<(), anyhow::Error> {
         let mut last_mail = self.last_mail.lock().await;
         *last_mail = Some(info);
-        self.tr_in_tx.send(mes.to_vec()).await.unwrap_or_else(|e| {
-            log::error!("Failed to send data to terminal: {}", e);
-        });
+        self.tr_in_tx.send(mes.to_vec()).await?;
+        Ok(())
     }
 
     pub fn close(&self) {
@@ -117,10 +111,10 @@ impl Dispatcher {
         mut in_rx: Receiver<MessageFile>,
     ) -> Result<(), anyhow::Error> {
         while let Some(msg) = in_rx.recv().await {
-            if let Ok((bytes, info)) = MailInfo::from_bytes(msg.message_file) {
+            if let Ok((bytes, info)) = MailInfo::from_bytes(msg.file) {
                 self.update_last_email(&info).await;
                 let id = info.clone().flow_id.unwrap();
-                if id == "#MAIN" {
+                if id == "MAIN" {
                     self.pull_main(bytes, info, out_tx.clone()).await;
                     continue;
                 }
@@ -128,9 +122,9 @@ impl Dispatcher {
                     ClientContext::create(out_tx.clone(), self.tick_interval)
                         .unwrap_or_else(|e| panic!("Failed to create client context: {}", e))
                 });
-                context.send_to_tr(bytes, info).await;
+                context.send_to_tr(bytes, info).await?;
             } else {
-                log::error!("Failed to parse email message, skipping");
+                log::debug!("Skipping message with invalid format");
                 continue;
             }
         }
@@ -153,17 +147,14 @@ impl Dispatcher {
                 let mut answer = Vec::new();
                 write!(answer, "#MAIN 0 {:#?}", self.clients).unwrap();
                 let reply_info = info.clone().create_reply();
-                let message_file = reply_info
-                    .clone()
-                    .to_message_file(Bytes::from(answer))
-                    .unwrap();
+                let file = reply_info.clone().to_file(Bytes::from(answer)).unwrap();
                 let mes = MessageFile {
-                    message_file,
+                    file,
                     info: Some(reply_info),
                     client: info.from.clone(),
                 };
                 out_tx.send(mes).await.unwrap_or_else(|e| {
-                    log::error!("Failed to send message to terminal: {}", e);
+                    log::error!("Failed to send main info response: {}", e);
                 });
             } else if rec.starts_with("#MAIN killself") {
                 panic!("Received killself command, shutting down");

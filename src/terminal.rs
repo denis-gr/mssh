@@ -48,12 +48,10 @@ impl Terminal {
 
     pub async fn run(&mut self, out_tx: Sender<Vec<u8>>, mut in_rx: Receiver<Vec<u8>>) {
         let (tx, mut rx) = channel::<Vec<u8>>(128);
-
         let mut reader = self
             .reader
             .take()
             .expect("Terminal reader should exist when run() is called");
-
         tokio::task::spawn_blocking(move || {
             let mut buffer = [0u8; 4096];
             loop {
@@ -61,25 +59,33 @@ impl Terminal {
                     Ok(0) => break,
                     Ok(n) => {
                         if tx.blocking_send(buffer[..n].to_vec()).is_err() {
+                            log::error!("Failed to send data from terminal reader to channel");
                             break;
                         }
+                        log::debug!("Read {} bytes from terminal", n);
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        log::error!("Failed to read from terminal: {}", e);
+                        break;
+                    }
                 }
             }
         });
         loop {
             tokio::select! {
                 Some(data) = in_rx.recv() => {
-                    if self.writer.write_all(&data).is_err() {
+                    if let Err(e) = self.writer.write_all(&data) {
+                        log::error!("Failed to write to terminal: {}", e);
                         break;
                     }
-                    if self.writer.flush().is_err() {
+                    if let Err(e) = self.writer.flush() {
+                        log::error!("Failed to flush terminal writer: {}", e);
                         break;
                     }
                 }
                 Some(data) = rx.recv() => {
-                    if out_tx.send(data).await.is_err() {
+                    if let Err(e) = out_tx.send(data).await {
+                        log::error!("Failed to send data to output channel: {}", e);
                         break;
                     }
                 }

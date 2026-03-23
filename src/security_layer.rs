@@ -3,13 +3,11 @@ use crate::opengpg_utils::Helper;
 
 use anyhow::anyhow;
 use bytes::Bytes;
-use log;
 use mail_parser::{MimeHeaders, PartType};
 use std::io::Write;
-use tokio::sync::mpsc::{Receiver, Sender};
 
 pub struct SecurityLayer {
-    helper: Helper,
+    h: Helper,
     pass_raw: bool,
 }
 
@@ -20,43 +18,14 @@ impl SecurityLayer {
         pass_raw: bool,
     ) -> Result<Self, anyhow::Error> {
         Ok(Self {
-            helper: Helper::load_dir(path, pgp_password)?,
+            h: Helper::load_dir(path, pgp_password)?,
             pass_raw: pass_raw,
         })
     }
 
-    pub async fn run(
-        &self,
-        in_tx: Sender<MessageFile>,
-        mut in_rx: Receiver<MessageFile>,
-        out_tx: Sender<MessageFile>,
-        mut out_rx: Receiver<MessageFile>,
-    ) -> Result<(), anyhow::Error> {
-        loop {
-            tokio::select! {
-                Some(msg) = in_rx.recv() => {
-                    match self.decrypt(msg) {
-                        Ok(decrypted) => out_tx.send(decrypted).await?,
-                        Err(e) => {
-                            log::error!("Decryption failed: {}", e);
-                        }
-                    }
-                }
-                Some(msg) = out_rx.recv() => {
-                    match self.encrypt(msg) {
-                        Ok(encrypted) => in_tx.send(encrypted).await?,
-                        Err(e) => {
-                            log::error!("Encryption failed: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn decrypt(&self, mes: MessageFile) -> Result<MessageFile, anyhow::Error> {
+    pub fn decrypt(&self, mes: MessageFile) -> Result<MessageFile, anyhow::Error> {
         let mail = mail_parser::MessageParser::default()
-            .parse(mes.message_file.as_ref())
+            .parse(mes.file.as_ref())
             .ok_or(anyhow!("Failed to parse email message"))?;
         let ct = mail.content_type().ok_or(anyhow!("Content-Type missing"))?;
         let typ = ct.ctype();
@@ -66,7 +35,6 @@ impl SecurityLayer {
             && subtyp == "encrypted"
             && protocol == Some("application/pgp-encrypted")
         {
-            log::info!("Decrypting message from {} (pgp-encrypted)", mes.client);
             let part = mail
                 .attachments()
                 .find(|a| {
@@ -84,7 +52,7 @@ impl SecurityLayer {
                     return Err(anyhow!("Unsupported content type in encrypted part"));
                 }
             };
-            let decrypted = self.helper.decrypt_message(content)?;
+            let decrypted = self.h.decrypt_message(content)?;
             drop(mes);
             let inner_mail = mail_parser::MessageParser::default()
                 .parse(&decrypted)
@@ -103,43 +71,30 @@ impl SecurityLayer {
             return Ok(MessageFile {
                 client: real_addr[0].to_string(), // Always trust the decrypted From header
                 info: None,
-                message_file: Bytes::from(decrypted),
+                file: Bytes::from(decrypted),
             });
         } else if typ == "multipart"
             && subtyp == "signed"
             && protocol == Some("application/pgp-signature")
         {
-            log::info!("Decrypting message from {} (pgp-signature)", mes.client);
             // TODO: support signed messages
             return Err(anyhow!("Signed messages are not supported"));
         } else if self.pass_raw {
-            log::info!("Decrypting message from {} (Non-encrypted)", mes.client);
             return Ok(mes.clone());
         } else {
-            return Err(anyhow!(
-                "Message is not encrypted/signed and pass_raw is false"
-            ));
+            return Err(anyhow!("Message unencrypted/unsigned and !pass_raw"));
         }
     }
 
-    fn encrypt(&self, msg: MessageFile) -> Result<MessageFile, anyhow::Error> {
-        let encrypted_bytes = match self
-            .helper
-            .encrypt_message(msg.message_file.as_ref(), msg.client.clone())
-        {
+    pub fn encrypt(&self, msg: MessageFile) -> Result<MessageFile, anyhow::Error> {
+        let email = msg.client.clone();
+        let val = match self.h.encrypt_message(msg.file.as_ref(), email) {
             Ok(encrypted) => Ok(encrypted),
-            Err(e) => {
-                if self.pass_raw {
-                    log::info!("Encrypting message to {} (Non-encrypted)", msg.client);
-                    return Ok(msg.clone());
-                } else {
-                    Err(anyhow!("Encryption failed: {}", e))
-                }
-            }
+            Err(e) if self.pass_raw => return Ok(msg),
+            Err(e) => Err(anyhow!("Encryption failed: {}", e)),
         }?;
-        let encrypted = String::from_utf8(encrypted_bytes)?;
+        let encrypted = String::from_utf8(val)?;
         let encrypted_len = encrypted.len();
-        log::info!("Encrypting message to {} (pgp-encrypted)", msg.client);
         let info = msg.info.as_ref().unwrap().clone();
         let client = msg.client.clone();
         drop(msg);
@@ -157,7 +112,7 @@ impl SecurityLayer {
             write!(b, "In-Reply-To: <{}>\r\n", in_reply)?;
         }
         if let Some(r) = info.reference {
-            let r = r.iter().map(|s: &String| format!("<{}>", s)).collect::<Vec<_>>();
+            let r: Vec<String> = r.iter().map(|s| format!("<{}>", s)).collect();
             write!(b, "References: {}\r\n", r.join("\r\n "))?;
         }
         write!(b, "Content-Type: multipart/encrypted;\r\n")?;
@@ -175,7 +130,7 @@ impl SecurityLayer {
         Ok(MessageFile {
             client: client,
             info: None,
-            message_file: Bytes::from(b),
+            file: Bytes::from(b),
         })
     }
 }
